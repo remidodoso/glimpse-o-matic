@@ -1,0 +1,311 @@
+<html>
+
+<head>
+    <meta charset="utf-8" />
+    <script>
+        var images = [
+            "SI_P_0008_001_20191222_140913.jpg",
+            "SI_P_0008_001_20191222_141307.jpg",
+            "SI_P_0008_002_20191222_141003.jpg",
+            "SI_P_0008_002_20191222_143024.jpg",
+            "SI_P_0008_003_20191222_141032.jpg",
+            "SI_P_0008_005_20191222_142319.jpg",
+            "SI_P_0008_006_20191222_142416.jpg",
+            "SI_P_0008_007_20191222_141018.jpg",
+            "SI_P_0008_008_20191222_140927.jpg",
+            "SI_P_0017_001_20191202_192307.jpg",
+            "SI_P_0017_002_20191202_192311.jpg",
+            "SI_P_0017_003_20191202_192341.jpg",
+            "SI_P_0017_005_20191202_193022.jpg",
+            "SI_P_0017_006_20191202_193826.jpg",
+            "SI_P_0017_007_20191202_194027.jpg",
+            "SI_P_0017_009_20191202_194917.jpg",
+            "SI_P_0017_010_20191202_194941.jpg",
+            "SI_P_0017_014_20191202_201123.jpg",
+            "SI_P_0017_015_20191202_201152.jpg",
+            "SI_P_0017_017_20191202_201211.jpg",
+        ];
+
+        var thumbs = [];
+
+        async function create_thumbnails() {
+            var header_container = document.getElementById('header_container');
+            for (let i = 0; i < images.length; i++) {
+                var canvas = document.createElement("canvas");
+                canvas.dataset.imageNumber = i;
+                canvas.dataset.imageSrc = images[i];
+                header_container.appendChild(canvas);
+            }
+            var l = Array.from(header_container.getElementsByTagName('CANVAS'));
+            l.forEach(canvas => {
+                var image = new Image();
+                var ctx = canvas.getContext('2d');
+                image.onload = function () {
+                    var scale;
+                    //                    if (image.width > image.height) {
+                    //                        scale = 240.0 / image.width;
+                    //                    } else {
+                    scale = 160.0 / image.height;
+                    //                    }
+                    canvas.width = image.width * scale;
+                    canvas.height = image.height * scale;
+                    canvas.style.boxShadow = '5px 5px 4px #888';
+                    canvas.style.border = '1px solid #bbb';
+                    canvas.style.borderRadius = '8px';
+                    canvas.style.margin = '4px';
+                    canvas.addEventListener('click', event => {
+                        current_index = canvas.dataset.imageNumber;
+                        draw();
+                    })
+                    ctx.scale(scale, scale);
+                    ctx.drawImage(image, 0, 0);
+                    return true;
+                }
+                image.src = canvas.dataset.imageSrc;
+            })
+        }
+
+        var current_index = 0;
+        var rotation = 0;
+        function init() {
+            el = document.getElementById('photo');
+            el.onwheel = wheel;
+            document.onkeydown = keydown;
+            create_thumbnails();
+        }
+        function advance() {
+            current_index++;
+            if (current_index >= images.length) {
+                current_index = 0;
+            }
+            draw();
+        }
+        function retreat() {
+            current_index--;
+            if (current_index < 0) {
+                current_index = images.length - 1;
+            }
+            draw();
+        }
+        function wheel(event) {
+            if (event.deltaY > 0) {
+                advance();
+            } else {
+                retreat();
+            }
+        }
+        function keydown(event) {
+            if (event.key == 'ArrowRight' || event.key == 'Right') {
+                advance();
+            } else if (event.key == 'ArrowLeft' || event.key == 'Left') {
+                retreat();
+            }
+        }
+        function rotate() {
+
+        }
+        function torate() {
+
+        }
+        function steg(canvas) {
+            var x = canvas.width / 2;
+            var y = canvas.height / 2;
+            var ctx = canvas.getContext('2d');
+            var image_data = ctx.getImageData(x, y, 100, 1);
+            for (let i = 0; i < 100; i++) {
+                image_data.data[i * 4] %= 240;
+                image_data.data[i * 4 + 1] %= 240;
+                image_data.data[i * 4 + 2] %= 240;
+                image_data.data[i * 4 + 3] = 255;
+            }
+            ctx.putImageData(image_data, x, y);
+        }
+
+        function draw(image_number = null) {
+
+            //
+            // Draw into a hidden canvas first to avoid flicker
+            //
+            var backing_canvas = document.getElementById('backing');
+            var canvas = document.getElementById('photo');
+            if (backing_canvas.getContext) {
+                var backing_ctx = backing_canvas.getContext('2d');
+            }
+            photo_box = document.getElementById('photo here');
+            backing_canvas.width = photo_box.clientWidth;
+            backing_canvas.height = photo_box.clientHeight;
+            var image = new Image();
+
+            image.onload = function () {
+                var scale = Math.min(backing_canvas.width / image.width, backing_canvas.height / image.height);
+                var h_pad = (backing_canvas.width - image.width * scale) / 2.0;
+                var v_pad = (backing_canvas.height - image.height * scale) / 2.0;
+
+                size = document.getElementById('size');
+                size.innerHTML = '' +
+                    image.width + ' x ' + image.height;
+                filename = document.getElementById('filename');
+
+                // Planning to use data URLs to create secure-ish links to stegged images.
+                // This seems like it will work, but takes a few seconds or more to do so
+                // it will have to be done on request for a download.
+                //
+                // data_url = canvas.toDataURL();
+
+                filename.innerHTML =
+                    '<a target="_blank" href="' + images[current_index] + '">' +
+                    '<span style="font-size: smaller">view 👁️</span>' +
+                    '</a> ' +
+                    '<a download href="' + images[current_index] + '">' +
+                    '<span style="font-size: smaller">download ⤵️</span>' +
+                    '</a>';
+
+
+                backing_ctx.save();
+                backing_ctx.fillStyle = '#777';
+                backing_ctx.fillRect(0, 0, backing_canvas.width, backing_canvas.height);
+                backing_ctx.translate(h_pad, v_pad);
+                backing_ctx.scale(scale, scale);
+                backing_ctx.drawImage(image, 0, 0);
+                backing_ctx.restore();
+                if (canvas.getContext) {
+                    var ctx = canvas.getContext('2d');
+                }
+                canvas.width = photo_box.clientWidth;
+                canvas.height = photo_box.clientHeight;
+                ctx.drawImage(backing_canvas, 0, 0);
+                steg(canvas);
+            }
+            image.crossOrigin = "";
+            image.src = images[current_index];
+        }
+    </script>
+    <style>
+        p {
+            margin: auto;
+            vertical-align: top;
+            display: table-cell;
+        }
+
+        body {
+            overflow: hidden;
+            margin: 0;
+            color: black;
+            text-align: center;
+            font-family: 'Lucida Sans', 'Lucida Sans Regular', 'Lucida Grande', 'Lucida Sans Unicode', Geneva, Verdana, sans-serif;
+        }
+
+        a:visited,
+        a:link,
+        a:active {
+            color: black;
+        }
+
+        a:hover {
+            color: red;
+        }
+
+        table {
+            border-spacing: 0;
+        }
+
+        td {
+            padding: 0;
+            border: none;
+            text-align: center;
+            background-color: bisque;
+        }
+
+        tr.headfoot {
+            height: 5%;
+            min-height: 5%;
+            max-height: 5%;
+        }
+
+        tr.photo {}
+
+        td.photo {
+            background-color: #777;
+        }
+
+        canvas.photo {
+            padding: 0px;
+            margin: 0;
+            border: none;
+
+        }
+
+        div.header {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            min-height: 30%;
+            max-height: 30%;
+            background-color: bisque;
+        }
+
+        div.footer {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            min-height: 5%;
+            height: 5%;
+            background-color: bisque;
+        }
+
+        div.gallery {
+            height: 90%;
+        }
+
+        div.main-container {
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+            min-height: 100%;
+        }
+    </style>
+</head>
+
+<body onload="init(); draw();" onresize="draw();">
+    <div class="main-container">
+        <div class="header">
+            <div style="vertical-align: middle;" id="header_container">
+                <div>
+                    Semi-Interesting Gallery
+                </div>
+            </div>
+        </div>
+        <div class="gallery" id="photo here">
+            <canvas id='photo' onclick="advance();" oncontextmenu="return false;"> </canvas>
+        </div>
+        <div class="footer">
+            <div>
+                <span id="size"></span> <span id="filename"></span>
+            </div>
+        </div>
+    </div>
+    <canvas id='backing' hidden></canvas>
+    <!--
+
+
+    <table style="width: 100%; height: 100%;">
+        <tr class="headfoot">
+            <td>&nbsp;</td>
+        </tr>
+        <tr class='photo'>
+            <td class='photo' id='photo here' onwheel="wheel">
+                <canvas id='photo' onclick="advance();" oncontextmenu="return false;"> </canvas>
+            </td>
+        </tr>
+        <tr class="headfoot">
+            <td>
+                <span id="size"></span>
+                <span id="filename"></span>        
+            </td>
+        </tr>
+    </table>
+    <canvas id='backing' hidden></canvas>
+        -->
+</body>
+
+</html>
