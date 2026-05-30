@@ -1,25 +1,5 @@
-var images = [
-    "SI_P_0008_001_20191222_140913.jpg",
-    "SI_P_0008_001_20191222_141307.jpg",
-    "SI_P_0008_002_20191222_141003.jpg",
-    "SI_P_0008_002_20191222_143024.jpg",
-    "SI_P_0008_003_20191222_141032.jpg",
-    "SI_P_0008_005_20191222_142319.jpg",
-    "SI_P_0008_006_20191222_142416.jpg",
-    "SI_P_0008_007_20191222_141018.jpg",
-    "SI_P_0008_008_20191222_140927.jpg",
-    "SI_P_0017_001_20191202_192307.jpg",
-    "SI_P_0017_002_20191202_192311.jpg",
-    "SI_P_0017_003_20191202_192341.jpg",
-    "SI_P_0017_005_20191202_193022.jpg",
-    "SI_P_0017_006_20191202_193826.jpg",
-    "SI_P_0017_007_20191202_194027.jpg",
-    "SI_P_0017_009_20191202_194917.jpg",
-    "SI_P_0017_010_20191202_194941.jpg",
-    "SI_P_0017_014_20191202_201123.jpg",
-    "SI_P_0017_015_20191202_201152.jpg",
-    "SI_P_0017_017_20191202_201211.jpg",
-];
+var images = [];
+var blob_urls = {};
 
 const G_THUMBNAIL_HEIGHT = 160.0;
 
@@ -57,18 +37,42 @@ var zoom_pan_x = 0;
 var zoom_pan_y = 0;
 
 // ---------------------------------------------------------------------------
+// Loading screen
+// ---------------------------------------------------------------------------
+
+function create_loading_screen() {
+    var div = document.getElementById('loading');
+    ['Welcome to Glimpse-o-Matic!', 'Loading now ....'].forEach(function(text) {
+        var line = document.createElement('div');
+        line.className = 'loading-line';
+        var delay = 0;
+        text.split('').forEach(function(ch) {
+            var span = document.createElement('span');
+            span.textContent = ch === ' ' ? ' ' : ch;
+            span.style.animationDelay = delay.toFixed(2) + 's';
+            if (ch !== ' ') delay += 0.05;
+            line.appendChild(span);
+        });
+        div.appendChild(line);
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Image loading
 // ---------------------------------------------------------------------------
 
 function preload_images() {
     images.forEach(function(src, i) {
         var img = new Image();
-        img.crossOrigin = "";
         img.onload = function() {
             image_cache[src] = img;
-            if (i === 0) draw(0);
+            if (i === 0) {
+                var loading = document.getElementById('loading');
+                if (loading) loading.remove();
+                draw(0);
+            }
         };
-        img.src = src;
+        img.src = blob_urls[src];
     });
 }
 
@@ -81,7 +85,7 @@ function create_thumbnails() {
     for (let i = 0; i < images.length; i++) {
         var canvas = document.createElement("canvas");
         canvas.dataset.imageNumber = i;
-        canvas.dataset.imageSrc = images[i];
+        canvas.dataset.imageSrc = blob_urls[images[i]];
         var divbox = document.createElement('DIV');
         divbox.appendChild(canvas);
         header_container.appendChild(divbox);
@@ -321,10 +325,10 @@ function draw(offset) {
         draw_image_in_column(ctx, cur_img, offset, W, H);
         document.getElementById('size').innerHTML = cur_img.naturalWidth + ' x ' + cur_img.naturalHeight;
         document.getElementById('filename').innerHTML =
-            '<a target="_blank" href="' + images[current_index] + '">' +
+            '<a target="_blank" href="' + blob_urls[images[current_index]] + '">' +
             '<span style="font-size: smaller">view 👁️</span>' +
             '</a> ' +
-            '<a download href="' + images[current_index] + '">' +
+            '<a download="' + images[current_index] + '" href="' + blob_urls[images[current_index]] + '">' +
             '<span style="font-size: smaller">download ⤵️</span>' +
             '</a>';
     }
@@ -611,7 +615,19 @@ function init() {
     header.addEventListener('touchend',    function() { carousel_is_dragging = false; }, false);
     header.addEventListener('touchcancel', function() { carousel_is_dragging = false; }, false);
 
-    create_thumbnails();
-    preload_images();
-    set_current_index(0);
+    create_loading_screen();
+    fetch('Demo.zip')
+        .then(function(r) { return r.arrayBuffer(); })
+        .then(function(buf) {
+            var unzipped = fflate.unzipSync(new Uint8Array(buf));
+            images = Object.keys(unzipped)
+                .filter(function(name) { return /\.(jpe?g|png|gif|webp)$/i.test(name); })
+                .sort();
+            images.forEach(function(name) {
+                blob_urls[name] = URL.createObjectURL(new Blob([unzipped[name]], {type: 'image/jpeg'}));
+            });
+            create_thumbnails();
+            preload_images();
+            set_current_index(0);
+        });
 }
