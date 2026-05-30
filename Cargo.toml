@@ -1,0 +1,3 @@
+[workspace]
+members = ["glimr", "tools/packg"]
+resolver = "2"

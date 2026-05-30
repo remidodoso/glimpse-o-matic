@@ -36,6 +36,16 @@ var zoom_mode = false;
 var zoom_pan_x = 0;
 var zoom_pan_y = 0;
 
+const XOR_KEY = [0xDE, 0xAD, 0xBE, 0xEF];
+
+function xor_decode(bytes) {
+    var out = new Uint8Array(bytes.length);
+    for (var i = 0; i < bytes.length; i++) {
+        out[i] = bytes[i] ^ XOR_KEY[i % 4];
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Loading screen
 // ---------------------------------------------------------------------------
@@ -328,7 +338,7 @@ function draw(offset) {
             '<a target="_blank" href="' + blob_urls[images[current_index]] + '">' +
             '<span style="font-size: smaller">view 👁️</span>' +
             '</a> ' +
-            '<a download="' + images[current_index] + '" href="' + blob_urls[images[current_index]] + '">' +
+            '<a download="' + images[current_index].replace(/\.dat$/i, '.jpg') + '" href="' + blob_urls[images[current_index]] + '">' +
             '<span style="font-size: smaller">download ⤵️</span>' +
             '</a>';
     }
@@ -621,10 +631,11 @@ function init() {
         .then(function(buf) {
             var unzipped = fflate.unzipSync(new Uint8Array(buf));
             images = Object.keys(unzipped)
-                .filter(function(name) { return /\.(jpe?g|png|gif|webp)$/i.test(name); })
+                .filter(function(name) { return /\.(jpe?g|png|gif|webp|dat)$/i.test(name); })
                 .sort();
             images.forEach(function(name) {
-                blob_urls[name] = URL.createObjectURL(new Blob([unzipped[name]], {type: 'image/jpeg'}));
+                var bytes = /\.dat$/i.test(name) ? xor_decode(unzipped[name]) : unzipped[name];
+                blob_urls[name] = URL.createObjectURL(new Blob([bytes], {type: 'image/jpeg'}));
             });
             create_thumbnails();
             preload_images();
