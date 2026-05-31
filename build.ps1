@@ -6,6 +6,13 @@ $html  = $html -replace '<!-- Build \d{4}:\d{4} -->', "<!-- Build $stamp -->"
 [System.IO.File]::WriteAllText($file, $html, (New-Object System.Text.UTF8Encoding $false))
 Write-Host "Build $stamp"
 
+# Build glimr (WASM)
+Write-Host "Building glimr (WASM)..."
+wasm-pack build glimr --target web --out-dir ../pkg
+if ($LASTEXITCODE -ne 0) { Write-Error "wasm-pack build failed"; exit 1 }
+Remove-Item -Force "$PSScriptRoot\pkg\.gitignore" -ErrorAction SilentlyContinue
+Write-Host "glimr -> pkg/"
+
 # Build Rust tools
 Write-Host "Building packg..."
 cargo build --release -p packg

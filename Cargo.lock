@@ -259,6 +259,10 @@ dependencies = [
 [[package]]
 name = "glimr"
 version = "0.1.0"
+dependencies = [
+ "wasm-bindgen",
+ "zip",
+]
 
 [[package]]
 name = "hashbrown"

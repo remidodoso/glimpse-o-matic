@@ -1,0 +1,15 @@
+{
+  "name": "glimr",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "glimr_bg.wasm",
+    "glimr.js",
+    "glimr.d.ts"
+  ],
+  "main": "glimr.js",
+  "types": "glimr.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

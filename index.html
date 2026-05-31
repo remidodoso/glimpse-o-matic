@@ -1,13 +1,18 @@
 <html> <head>
     <meta charset="utf-8" />
-    <!-- Build 0530:1253 -->
-
-    <script src="https://cdn.jsdelivr.net/npm/fflate/umd/index.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <!-- Build 0531:1338 -->
+ 
+    <script type="module">
+        import init, { xor_decode, GlimrZip } from './pkg/glimr.js';
+        await init();
+        window.glimr = { xor_decode, GlimrZip };
+    </script>
     <script type="text/javascript" src="main.js"></script>
     <link rel="stylesheet" href="main.css">
 </head>
 
-<body onload="init(); draw();" onresize="draw();">
+<body onload="init(); draw();">
     <div class="main-container">
         <div class="header" id="header_container">
         </div>
@@ -15,11 +20,12 @@
             <div id="loading"></div>
             <canvas id='photo' oncontextmenu="return false;"> </canvas>
         </div>
-        <div class="footer">
-            <div>
-                <span id="size"></span> <span id="filename"></span>
-            </div>
-        </div>
+
+    </div>
+    <div id="button-bar">
+        <button id="btn-load"       class="action-btn">&#x1F5BC;</button>
+        <button id="btn-fullscreen" class="action-btn">&#x26F6;</button>
+        <button id="btn-download"   class="action-btn">&#x2B07;</button>
     </div>
     <canvas id='backing' hidden></canvas>
     <!--
