@@ -133,15 +133,17 @@ Bottom-right corner, `position: fixed`, horizontal row layout: `[🖼] [⛶] [�
 - Cancels in-flight animations, shows loading screen
 - Revokes old blob URLs (memory management)
 - Resets all state: images, blob_urls, image_cache, zoom, current_index, thumbnails
-- Parses zip with `fflate.unzipSync`; filters/sorts entries
-- XOR-decodes `.dat` files; passes plain image files through
-- Creates blob URLs, builds thumbnails, preloads images
+- Passes raw bytes to `GlimrZip` (WASM) which parses, filters, sorts, and XOR-decodes
+- JS iterates entries via `entry_name(i)` / `entry_data(i)`, creates blob URLs
+- Calls `archive.free()` to release WASM memory after all blob URLs are created
 - Used for both initial `Demo.zip` fetch and file-picker loads
+- No external CDN dependencies — fflate removed
 
 ### Build Script (`build.ps1`)
 
 - Stamps `<!-- Build MMDD:HHMM -->` in `index.html` to bust browser cache
-- Builds `packg` with `cargo build --release -p packg` and copies to `tools/bin/`
+- Builds `glimr` WASM via `wasm-pack build glimr --target web --out-dir ../pkg`; removes the `pkg/.gitignore` wasm-pack generates so `pkg/` is committable
+- Builds `packg` and `deployg` via `cargo build --release -p packg -p deployg`; copies both to `tools/bin/`
 
 ---
 
@@ -163,13 +165,18 @@ Move state machine (current_index, zoom state, drag state, animation loops) to W
 ### Phase 4 — Bootstrap only in JS
 JS handles: load WASM module, pass control, file picker trigger, `fetch`, `requestFullscreen` — things that require a browser user-gesture context. Everything else is WASM.
 
-**Tooling**: `wasm-pack build glimr --target web` → `pkg/` directory. `build.ps1` gains this step. `glimr/` crate already exists in workspace.
+**Tooling**: `wasm-pack build glimr --target web` → `pkg/` directory. Integrated into `build.ps1`. `glimr/` crate in workspace.
 
 ---
 
+## Status — Milestones
+
+- **Phase 1 WASM complete**: `xor_decode` + `GlimrZip` in Rust; fflate CDN removed; single JS/WASM boundary crossing per zip load
+- **deployg tool**: creates self-contained gallery folder (index.html, main.js, main.css, pkg/, Demo.zip); tested and successfully deployed to Wasabi S3 bucket
+- **End-to-end flow working**: pack with `packg`, deploy with `deployg`, serve from Wasabi, view in browser
+
 ## TODO
 
-- **Phase 1 WASM migration**: `xor_decode` in Rust, wasm-pack pipeline, replace JS call
 - Animate zoom transitions (smooth zoom on wheel/pinch/keyboard)
 - Additional zoom options
 - Info popup (image dimensions, filename — replaces removed footer)
@@ -180,3 +187,6 @@ JS handles: load WASM module, pass control, file picker trigger, `fetch`, `reque
 - Cache-busting for `main.js`, `main.css`, `Demo.zip`
 - Recursion option for packg (currently flat directory only — "maybe" noted)
 - PWA manifest for iOS home-screen fullscreen
+- deployg: S3/Wasabi direct upload (access key support)
+- deployg: configurable gallery zip name in output (rather than always Demo.zip)
+- WASM streaming zip parser (progressive thumbnail display during download)

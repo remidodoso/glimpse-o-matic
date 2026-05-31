@@ -14,16 +14,18 @@ Remove-Item -Force "$PSScriptRoot\pkg\.gitignore" -ErrorAction SilentlyContinue
 Write-Host "glimr -> pkg/"
 
 # Build Rust tools
-Write-Host "Building packg..."
-cargo build --release -p packg
+Write-Host "Building Rust tools..."
+cargo build --release -p packg -p deployg
 if ($LASTEXITCODE -ne 0) { Write-Error "cargo build failed"; exit 1 }
 
 $bin_dir = "$PSScriptRoot\tools\bin"
 if (-not (Test-Path $bin_dir)) { New-Item -ItemType Directory -Path $bin_dir | Out-Null }
 
-if (Test-Path "$PSScriptRoot\target\release\packg.exe") {
-    Copy-Item "$PSScriptRoot\target\release\packg.exe" "$bin_dir\packg.exe" -Force
-} else {
-    Copy-Item "$PSScriptRoot\target\release\packg" "$bin_dir\packg" -Force
+foreach ($tool in @("packg", "deployg")) {
+    if (Test-Path "$PSScriptRoot\target\release\$tool.exe") {
+        Copy-Item "$PSScriptRoot\target\release\$tool.exe" "$bin_dir\$tool.exe" -Force
+    } else {
+        Copy-Item "$PSScriptRoot\target\release\$tool" "$bin_dir\$tool" -Force
+    }
 }
-Write-Host "packg -> tools/bin/"
+Write-Host "packg, deployg -> tools/bin/"
