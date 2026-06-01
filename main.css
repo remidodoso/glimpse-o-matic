@@ -77,6 +77,98 @@ div.gallery {
     grid-area: gallery;
 }
 
+#info-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 50;
+}
+
+#info-box {
+    border-radius: 14px;
+    border: 2px solid white;
+    overflow: hidden;
+    min-width: 260px;
+    max-width: 90vw;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+}
+
+#info-title {
+    background: burlywood;
+    padding: 12px 44px 12px 16px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+}
+
+#info-filename {
+    font-size: 1.2em;
+    font-weight: 500;
+    color: #333;
+    word-break: break-all;
+}
+
+#info-close {
+    position: absolute;
+    right: 10px;
+    top: 50%;
+    transform: translateY(-50%);
+    background: none;
+    border: none;
+    font-size: 1.1em;
+    color: #555;
+    cursor: pointer;
+    padding: 4px 6px;
+    line-height: 1;
+}
+
+#info-close:hover {
+    color: #000;
+}
+
+#info-body {
+    background: bisque;
+    padding: 16px 20px 20px 20px;
+}
+
+#info-content p {
+    display: block;
+    margin: 0.5em 0;
+    font-size: 1.3em;
+    font-weight: normal;
+    text-align: left;
+    color: #222;
+}
+
+.logo-watermark {
+    position: absolute;
+    width: auto;
+    height: auto;
+    max-width: min(20vw, 20vh);
+    max-height: min(20vw, 20vh);
+    opacity: 0.15;
+    mix-blend-mode: soft-light;
+    filter: drop-shadow(0 1px 2px rgba(255, 255, 255, 0.4));
+    pointer-events: none;
+    z-index: 2;
+}
+
+#logo-bottom {
+    bottom: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+}
+
+#logo-left {
+    left: 12px;
+    top: 50%;
+    transform: translateY(-50%) rotate(90deg);
+}
+
 #loading {
     position: absolute;
     inset: 0;
@@ -157,6 +249,12 @@ div.gallery {
 
 .action-btn.tapped-active {
     animation: btn-flash-active 0.35s ease-out forwards;
+}
+
+#btn-info {
+    font-family: serif;
+    font-style: normal;
+    font-weight: bold;
 }
 
 div.main-container {

@@ -87,18 +87,20 @@ Active (permission requested): geolocation
 ### Image Viewer
 
 - Click/tap **left or right third**: navigate previous/next with slide animation (250ms ease-out)
-- Click/tap **center third**: enter zoom mode (1:1 pixel scale)
+- Click/tap **center third**: enter zoom mode at 1:1 pixel scale
+- Click/tap **center third while in zoom mode**: exit zoom (returns to fit view regardless of current zoom level)
 - **Swipe/drag**: pan in zoom mode; slide-navigate in normal mode (25% threshold)
 - **Hover indicators**: `<` / `>` arrows fade in/out on left/right thirds, idle-timeout fade
 
 ### Zoom Mode
 
-- Entry: tap center → zoom_scale resets to 1.0, pan set to keep tapped pixel fixed
-- Exit: tap (without drag) while in zoom mode
+- **Entry**: tap center (1:1), scroll wheel up, pinch outward, or Ctrl+= — all enter at fit-scale seamlessly
+- **Exit**: tap while in zoom, scroll/pinch back to fit-scale (automatic), or press `0`
 - Range: fit-scale (image fills viewport) → 2.0× (double pixel size)
-- **Scroll wheel**: zooms toward cursor position (`Math.pow(1.001, -deltaY)` factor — smooth for both mice and trackpads)
-- **Pinch to zoom**: two-finger touch, zooms toward midpoint between fingers
-- **Ctrl+= / Ctrl+−**: 25% steps toward viewport center
+- **Scroll wheel**: enters zoom if not already in it; zooms toward cursor; exits automatically at fit-scale
+- **Pinch to zoom**: enters zoom if not already in it; zooms toward pinch midpoint; exits at fit-scale
+- **Ctrl+= / Ctrl+−**: 25% steps toward viewport center; Ctrl+= enters zoom, Ctrl+− exits at fit-scale
+- **Arrow keys in zoom mode**: pan image 80 screen-pixels per press in each direction (constant visual distance regardless of zoom level)
 - Drag pans image (adjusted for zoom_scale so drag distance feels consistent)
 
 ### Loading Screen
@@ -122,11 +124,22 @@ Bottom-right corner, `position: fixed`, horizontal row layout: `[🖼] [⛶] [�
 
 ### Keyboard Shortcuts
 
-- `←` / `→` arrows: navigate previous/next
+- `←` / `→` arrows: navigate previous/next (outside zoom mode)
+- `←` / `→` / `↑` / `↓` arrows: pan image while in zoom mode
+- `0`: exit zoom mode
 - `f` / `F`: toggle fullscreen
-- `Ctrl+=` / `Ctrl++`: zoom in (in zoom mode)
-- `Ctrl+−`: zoom out (in zoom mode)
+- `Ctrl+=` / `Ctrl++`: enter zoom (if needed) and zoom in
+- `Ctrl+−`: zoom out; exits zoom at fit-scale
 - `Esc`: exit fullscreen (browser native, `fullscreenchange` updates button state)
+
+### Logo Watermarks
+
+Two `sip.png` instances overlay `#lobjet_pane` at all times (`z-index: 2`, `pointer-events: none`):
+- **Bottom**: centered horizontally, 12px from bottom edge
+- **Left**: centered vertically, 12px from left edge, rotated 90° clockwise
+
+Sizing: `max-width: min(20vw, 20vh)` and `max-height: min(20vw, 20vh)` — constrains the long dimension to 20% of the shorter viewport axis, adapts automatically to any image aspect ratio.  
+Style: `opacity: 0.15`, `mix-blend-mode: soft-light`, `filter: drop-shadow(0 1px 2px rgba(255,255,255,0.4))` for a subtle indent/deboss look.
 
 ### Zip Loading Pipeline (`load_zip(buf)`)
 
@@ -177,6 +190,10 @@ JS handles: load WASM module, pass control, file picker trigger, `fetch`, `reque
 
 ## TODO
 
+- Slideshow / 3-state fullscreen: state 1 = normal; state 2 = fullscreen carousel+image (current); state 3 = fullscreen image-only with play/pause + advance/retreat, no zoom. Separate slideshow entry button desirable despite overlap with 3-state button.
+- Desktop (/mobile?) app — Tauri is the natural fit (Rust backend, system WebView, native file dialogs, single distributable); near-term option: local HTTP server binary (`serve` tool)
+- Consider support for embedding (iframe now works; longer term: Web Component / `<glimr-player src="...">` once WASM migration reaches Phase 3-4; near-term: `?zip=` URL param to select archive)
+- Rename `index.html` → `glimr.html`
 - Animate zoom transitions (smooth zoom on wheel/pinch/keyboard)
 - Additional zoom options
 - Info popup (image dimensions, filename — replaces removed footer)
@@ -187,6 +204,7 @@ JS handles: load WASM module, pass control, file picker trigger, `fetch`, `reque
 - Cache-busting for `main.js`, `main.css`, `Demo.zip`
 - Recursion option for packg (currently flat directory only — "maybe" noted)
 - PWA manifest for iOS home-screen fullscreen
+- Social preview (Open Graph): `meta.json` in source dir → included in zip by packg; deployg extracts designated preview image (XOR-decodes it), stamps `og:title`/`og:image` into output `index.html`; needs `--url` flag or similar for the absolute `og:image` URL
 - deployg: S3/Wasabi direct upload (access key support)
 - deployg: configurable gallery zip name in output (rather than always Demo.zip)
 - WASM streaming zip parser (progressive thumbnail display during download)

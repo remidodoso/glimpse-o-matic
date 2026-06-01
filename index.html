@@ -1,7 +1,7 @@
 <html> <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <!-- Build 0531:1430 -->
+    <!-- Build 0531:2118 -->
  
     <script type="module">
         import init, { xor_decode, GlimrZip } from './pkg/glimr.js';
@@ -19,6 +19,8 @@
         <div class="gallery" id="lobjet_pane">
             <div id="loading"></div>
             <canvas id='photo' oncontextmenu="return false;"> </canvas>
+            <img id="logo-bottom" class="logo-watermark" src="sip.png" alt="">
+            <img id="logo-left"   class="logo-watermark" src="sip.png" alt="">
         </div>
 
     </div>
@@ -26,6 +28,18 @@
         <button id="btn-load"       class="action-btn">&#x1F5BC;</button>
         <button id="btn-fullscreen" class="action-btn">&#x26F6;</button>
         <button id="btn-download"   class="action-btn">&#x2B07;</button>
+        <button id="btn-info"       class="action-btn">i</button>
+    </div>
+    <div id="info-overlay">
+        <div id="info-box">
+            <div id="info-title">
+                <span id="info-filename"></span>
+                <button id="info-close">&#x2715;</button>
+            </div>
+            <div id="info-body">
+                <div id="info-content"></div>
+            </div>
+        </div>
     </div>
     <canvas id='backing' hidden></canvas>
     <!--
