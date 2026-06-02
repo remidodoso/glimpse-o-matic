@@ -1,14 +1,26 @@
 /* tslint:disable */
 /* eslint-disable */
 export const memory: WebAssembly.Memory;
-export const __wbg_glimrzip_free: (a: number, b: number) => void;
-export const glimrzip_entry_count: (a: number) => number;
-export const glimrzip_entry_data: (a: number, b: number) => [number, number];
-export const glimrzip_entry_name: (a: number, b: number) => [number, number];
-export const glimrzip_new: (a: number, b: number) => [number, number, number];
+export const __wbg_glimrrenderer_free: (a: number, b: number) => void;
+export const glimr_log: (a: number, b: number, c: number, d: number) => void;
+export const glimrrenderer_draw: (a: number, b: number, c: number) => [number, number];
+export const glimrrenderer_draw_hover_indicator: (a: number, b: number, c: number, d: number, e: number) => [number, number];
+export const glimrrenderer_draw_thumbnail: (a: number, b: any, c: number, d: number, e: number) => [number, number];
+export const glimrrenderer_draw_zoomed: (a: number, b: number, c: number, d: number, e: number) => [number, number];
+export const glimrrenderer_image_count: (a: number) => number;
+export const glimrrenderer_image_file_size: (a: number, b: number) => number;
+export const glimrrenderer_image_height: (a: number, b: number) => number;
+export const glimrrenderer_image_name: (a: number, b: number) => [number, number];
+export const glimrrenderer_image_width: (a: number, b: number) => number;
+export const glimrrenderer_load_zip: (a: number, b: number, c: number) => [number, number];
+export const glimrrenderer_new: (a: any, b: any) => [number, number, number];
+export const glimrrenderer_raw_bytes: (a: number, b: number) => [number, number];
 export const xor_decode: (a: number, b: number) => [number, number];
+export const __wbindgen_exn_store: (a: number) => void;
+export const __externref_table_alloc: () => number;
 export const __wbindgen_externrefs: WebAssembly.Table;
-export const __wbindgen_free: (a: number, b: number, c: number) => void;
 export const __wbindgen_malloc: (a: number, b: number) => number;
+export const __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
 export const __externref_table_dealloc: (a: number) => void;
+export const __wbindgen_free: (a: number, b: number, c: number) => void;
 export const __wbindgen_start: () => void;

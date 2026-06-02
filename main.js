@@ -1,14 +1,23 @@
-var images = [];
-var blob_urls  = {};
-var file_sizes = {};
 var info_visible = false;
+
+// ---------------------------------------------------------------------------
+// Logging — [HH:MM:SS.SSS] <func> msg  (mirrors the Rust glog format)
+// ---------------------------------------------------------------------------
+function glimr_log(func, msg) {
+    var d = new Date();
+    var hh = String(d.getHours()).padStart(2, '0');
+    var mm = String(d.getMinutes()).padStart(2, '0');
+    var ss = String(d.getSeconds()).padStart(2, '0');
+    var ms = String(d.getMilliseconds()).padStart(3, '0');
+    console.log('[' + hh + ':' + mm + ':' + ss + '.' + ms + '] <' + func + '> ' + msg);
+}
 
 const G_CAROUSEL_SIZE_MAX = 160.0;
 var landscape_mq = window.matchMedia('(orientation: landscape)');
 
 var thumbs = [];
-var image_cache = {};
 var current_index = null;
+var thumb_gen = 0;  // incremented on each load; cancels stale thumbnail fills
 
 // Slide drag state
 var is_dragging = false;
@@ -66,15 +75,16 @@ function format_size(bytes) {
 
 function show_info() {
     if (current_index === null) return;
-    var name = images[current_index].replace(/\.dat$/i, '.jpg');
-    var img  = image_cache[images[current_index]];
-    var size = file_sizes[images[current_index]] || 0;
+    var name = renderer.image_name(current_index).replace(/\.dat$/i, '.jpg');
+    var img_w = renderer.image_width(current_index);
+    var img_h = renderer.image_height(current_index);
+    var size  = renderer.image_file_size(current_index);
 
     document.getElementById('info-filename').textContent = name;
 
     var content = document.getElementById('info-content');
     content.innerHTML = '';
-    [img && img.naturalWidth ? img.naturalWidth + ' × ' + img.naturalHeight : null,
+    [img_w && img_h ? img_w + ' × ' + img_h : null,
      format_size(size)
     ].forEach(function(text) {
         if (!text) return;
@@ -113,12 +123,15 @@ function toggle_fullscreen() {
 
 function download_current() {
     if (current_index === null) return;
+    var bytes = renderer.raw_bytes(current_index);
+    var url = URL.createObjectURL(new Blob([bytes], {type: 'image/jpeg'}));
     var a = document.createElement('a');
-    a.href = blob_urls[images[current_index]];
-    a.download = images[current_index].replace(/\.dat$/i, '.jpg');
+    a.href = url;
+    a.download = renderer.image_name(current_index).replace(/\.dat$/i, '.jpg');
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
+    URL.revokeObjectURL(url);
 }
 
 function load_zip(buf) {
@@ -130,11 +143,6 @@ function load_zip(buf) {
     if (loading) loading.style.display = '';
 
     if (info_visible) hide_info();
-    Object.keys(blob_urls).forEach(function(k) { URL.revokeObjectURL(blob_urls[k]); });
-    images        = [];
-    blob_urls     = {};
-    file_sizes    = {};
-    image_cache   = {};
     zoom_mode     = false;
     zoom_scale    = 1.0;
     zoom_pan_x    = 0;
@@ -145,19 +153,15 @@ function load_zip(buf) {
     header.innerHTML = '';
     thumbs = [];
 
-    var archive = new window.glimr.GlimrZip(new Uint8Array(buf));
-    var count = archive.entry_count();
-    for (var i = 0; i < count; i++) {
-        var name = archive.entry_name(i);
-        var blob = new Blob([archive.entry_data(i)], {type: 'image/jpeg'});
-        file_sizes[name] = blob.size;
-        images.push(name);
-        blob_urls[name] = URL.createObjectURL(blob);
-    }
-    archive.free();
+    glimr_log('load_zip', 'renderer.load_zip start (' + buf.byteLength + ' bytes)');
+    renderer.load_zip(new Uint8Array(buf));
+    glimr_log('load_zip', 'renderer.load_zip done');
     create_thumbnails();
-    preload_images();
     set_current_index(0);
+    if (loading) loading.style.display = 'none';
+    glimr_log('load_zip', 'calling draw(0)');
+    draw(0);
+    glimr_log('load_zip', 'done');
 }
 
 // ---------------------------------------------------------------------------
@@ -182,26 +186,6 @@ function create_loading_screen() {
 }
 
 // ---------------------------------------------------------------------------
-// Image loading
-// ---------------------------------------------------------------------------
-
-function preload_images() {
-    images.forEach(function(src, i) {
-        var img = new Image();
-        img.onload = function() {
-            image_cache[src] = img;
-            if (i === 0) {
-                var loading = document.getElementById('loading');
-                if (loading) loading.style.display = 'none';
-                draw(0);
-            }
-        };
-        img.src = blob_urls[src];
-    });
-}
-
-
-// ---------------------------------------------------------------------------
 // Carousel / thumbnails
 // ---------------------------------------------------------------------------
 
@@ -211,41 +195,39 @@ function create_thumbnails() {
         G_CAROUSEL_SIZE_MAX
     );
     var header_container = document.getElementById('header_container');
-    for (let i = 0; i < images.length; i++) {
+    var count = renderer.image_count();
+    var gen = ++thumb_gen;
+
+    for (let i = 0; i < count; i++) {
         var canvas = document.createElement("canvas");
         canvas.width  = 0;
         canvas.height = 0;
         canvas.dataset.imageNumber = i;
-        canvas.dataset.imageSrc = blob_urls[images[i]];
         var divbox = document.createElement('DIV');
         divbox.appendChild(canvas);
         header_container.appendChild(divbox);
         thumbs.push(canvas);
+        canvas.style.boxShadow = '5px 5px 4px #888';
+        canvas.style.border = '1px solid #bbb';
+        canvas.style.borderRadius = '8px';
+        canvas.style.margin = '4px';
+        canvas.addEventListener('click', function() {
+            if (carousel_drag_moved) { carousel_drag_moved = false; return; }
+            set_current_index(parseInt(canvas.dataset.imageNumber));
+            draw(0);
+        });
     }
-    var l = Array.from(header_container.getElementsByTagName('CANVAS'));
-    l.forEach(function(canvas) {
-        var image = new Image();
-        var ctx = canvas.getContext('2d');
-        image.onload = function() {
-            var scale = landscape_mq.matches
-                ? carousel_size / image.width
-                : carousel_size / image.height;
-            canvas.width = image.width * scale;
-            canvas.height = image.height * scale;
-            canvas.style.boxShadow = '5px 5px 4px #888';
-            canvas.style.border = '1px solid #bbb';
-            canvas.style.borderRadius = '8px';
-            canvas.style.margin = '4px';
-            canvas.addEventListener('click', function() {
-                if (carousel_drag_moved) { carousel_drag_moved = false; return; }
-                set_current_index(parseInt(canvas.dataset.imageNumber));
-                draw(0);
-            });
-            ctx.scale(scale, scale);
-            ctx.drawImage(image, 0, 0);
-        };
-        image.src = canvas.dataset.imageSrc;
-    });
+
+    // Decode and render thumbnails one per animation frame, starting after
+    // the first draw() so the main image appears before thumbnail work begins.
+    // The gen check cancels this fill if load_zip is called again.
+    requestAnimationFrame(function fill(i) {
+        if (gen !== thumb_gen || i >= thumbs.length) return;
+        glimr_log('create_thumbnails', 'draw_thumbnail start ' + i);
+        renderer.draw_thumbnail(thumbs[i], i, carousel_size, landscape_mq.matches);
+        glimr_log('create_thumbnails', 'draw_thumbnail done  ' + i);
+        requestAnimationFrame(function() { fill(i + 1); });
+    }.bind(null, 0));
 }
 
 function scroll_carousel_to(index) {
@@ -253,7 +235,7 @@ function scroll_carousel_to(index) {
     var hr   = header.getBoundingClientRect();
     var vert = landscape_mq.matches;
 
-    if (index < images.length - 1) {
+    if (index < renderer.image_count() - 1) {
         var nr = thumbs[index + 1].getBoundingClientRect();
         if (vert ? nr.bottom > hr.bottom + 1 : nr.right > hr.right + 1) {
             thumbs[index + 1].scrollIntoView({behavior: 'smooth', inline: 'nearest', block: 'nearest'});
@@ -292,31 +274,6 @@ function set_current_index(new_index) {
 // ---------------------------------------------------------------------------
 // Hover indicator
 // ---------------------------------------------------------------------------
-
-function hover_symbol() {
-    if (hover_zone === 'left')  return current_index === 0                 ? '>>' : '<';
-    if (hover_zone === 'right') return current_index === images.length - 1 ? '<<' : '>';
-    return '';
-}
-
-function draw_hover_indicator(canvas, W, H) {
-    if (hover_opacity <= 0 || hover_zone === null) return;
-    var symbol = hover_symbol();
-    var cx = hover_zone === 'left' ? W / 6 : W * 5 / 6;
-    var ctx = canvas.getContext('2d');
-    ctx.save();
-    ctx.globalAlpha = hover_opacity * 0.6;
-    ctx.fillStyle = '#ddd';
-    ctx.shadowColor = '#555';
-    ctx.shadowBlur = 4;
-    ctx.shadowOffsetX = 3;
-    ctx.shadowOffsetY = 3;
-    ctx.font = 'bold ' + Math.round(H * 0.10) + 'px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(symbol, cx, H / 2);
-    ctx.restore();
-}
 
 function fade_out_indicator() {
     if (hover_anim_id !== null) { cancelAnimationFrame(hover_anim_id); hover_anim_id = null; }
@@ -373,106 +330,17 @@ function refresh_hover() {
 // Drawing
 // ---------------------------------------------------------------------------
 
-function draw_image_in_column(ctx, image, col_x, col_w, col_h) {
-    var scale = Math.min(col_w / image.naturalWidth, col_h / image.naturalHeight);
-    var img_w = image.naturalWidth * scale;
-    var img_h = image.naturalHeight * scale;
-    var h_pad = (col_w - img_w) / 2.0;
-    var v_pad = (col_h - img_h) / 2.0;
-    ctx.drawImage(image, col_x + h_pad, v_pad, img_w, img_h);
-}
-
-function steg(canvas) {
-    var x = canvas.width / 2;
-    var y = canvas.height / 2;
-    var ctx = canvas.getContext('2d');
-    var image_data = ctx.getImageData(x, y, 100, 1);
-    for (let i = 0; i < 100; i++) {
-        image_data.data[i * 4]     &= 240;
-        image_data.data[i * 4 + 1] &= 240;
-        image_data.data[i * 4 + 2] &= 240;
-        image_data.data[i * 4 + 3] = 255;
-    }
-    ctx.putImageData(image_data, x, y);
-}
-
-function draw_zoomed() {
-    var backing_canvas = document.getElementById('backing');
-    var canvas = document.getElementById('photo');
-    var photo_box = document.getElementById('lobjet_pane');
-
-    var W = photo_box.clientWidth;
-    var H = photo_box.clientHeight;
-
-    backing_canvas.width = W;
-    backing_canvas.height = H;
-
-    var ctx = backing_canvas.getContext('2d');
-    ctx.fillStyle = '#777';
-    ctx.fillRect(0, 0, W, H);
-
-    var img = image_cache[images[current_index]];
-    if (img && img.complete && img.naturalWidth > 0) {
-        var src_w = Math.min(img.naturalWidth  - zoom_pan_x, W / zoom_scale);
-        var src_h = Math.min(img.naturalHeight - zoom_pan_y, H / zoom_scale);
-        var dst_w = src_w * zoom_scale;
-        var dst_h = src_h * zoom_scale;
-        ctx.drawImage(img,
-            zoom_pan_x, zoom_pan_y, src_w, src_h,
-            (W - dst_w) / 2, (H - dst_h) / 2, dst_w, dst_h);
-    }
-
-    canvas.width = W;
-    canvas.height = H;
-    canvas.getContext('2d').drawImage(backing_canvas, 0, 0);
-}
-
 function draw(offset) {
     if (offset === undefined) offset = 0;
     if (current_index === null) return;
     current_draw_offset = offset;
 
     if (zoom_mode) {
-        draw_zoomed();
-        return;
+        renderer.draw_zoomed(current_index, zoom_scale, zoom_pan_x, zoom_pan_y);
+    } else {
+        renderer.draw(current_index, offset);
     }
-
-    var backing_canvas = document.getElementById('backing');
-    var canvas = document.getElementById('photo');
-    var photo_box = document.getElementById('lobjet_pane');
-
-    var W = photo_box.clientWidth;
-    var H = photo_box.clientHeight;
-
-    backing_canvas.width = W;
-    backing_canvas.height = H;
-
-    var ctx = backing_canvas.getContext('2d');
-    ctx.fillStyle = '#777';
-    ctx.fillRect(0, 0, W, H);
-
-    var cur_img = image_cache[images[current_index]];
-    if (cur_img && cur_img.complete && cur_img.naturalWidth > 0) {
-        draw_image_in_column(ctx, cur_img, offset, W, H);
-    }
-
-    if (offset > 0 && current_index > 0) {
-        var prev_img = image_cache[images[current_index - 1]];
-        if (prev_img && prev_img.complete && prev_img.naturalWidth > 0) {
-            draw_image_in_column(ctx, prev_img, offset - W, W, H);
-        }
-    } else if (offset < 0 && current_index < images.length - 1) {
-        var next_img = image_cache[images[current_index + 1]];
-        if (next_img && next_img.complete && next_img.naturalWidth > 0) {
-            draw_image_in_column(ctx, next_img, offset + W, W, H);
-        }
-    }
-
-    canvas.width = W;
-    canvas.height = H;
-    canvas.getContext('2d').drawImage(backing_canvas, 0, 0);
-    steg(canvas);
-    draw_hover_indicator(canvas, W, H);
+    renderer.draw_hover_indicator(current_index, hover_zone || '', hover_opacity);
 }
 
 // ---------------------------------------------------------------------------
@@ -480,27 +348,30 @@ function draw(offset) {
 // ---------------------------------------------------------------------------
 
 function clamp_pan() {
-    var img = image_cache[images[current_index]];
-    if (!img) return;
+    if (current_index === null) return;
+    var img_w = renderer.image_width(current_index);
+    var img_h = renderer.image_height(current_index);
+    if (!img_w || !img_h) return;
     var photo_box = document.getElementById('lobjet_pane');
     var W = photo_box.clientWidth;
     var H = photo_box.clientHeight;
-    zoom_pan_x = Math.max(0, Math.min(zoom_pan_x, Math.max(0, img.naturalWidth  - W / zoom_scale)));
-    zoom_pan_y = Math.max(0, Math.min(zoom_pan_y, Math.max(0, img.naturalHeight - H / zoom_scale)));
+    zoom_pan_x = Math.max(0, Math.min(zoom_pan_x, Math.max(0, img_w - W / zoom_scale)));
+    zoom_pan_y = Math.max(0, Math.min(zoom_pan_y, Math.max(0, img_h - H / zoom_scale)));
 }
 
 function enter_zoom(tap_x, tap_y) {
-    var img = image_cache[images[current_index]];
-    if (!img || !img.complete || img.naturalWidth === 0) return;
+    var img_w = renderer.image_width(current_index);
+    var img_h = renderer.image_height(current_index);
+    if (!img_w || !img_h) return;
 
     var photo_box = document.getElementById('lobjet_pane');
     var W = photo_box.clientWidth;
     var H = photo_box.clientHeight;
 
     // Reverse the fit-scale to find which image pixel was tapped.
-    var scale = Math.min(W / img.naturalWidth, H / img.naturalHeight);
-    var h_pad = (W - img.naturalWidth  * scale) / 2;
-    var v_pad = (H - img.naturalHeight * scale) / 2;
+    var scale = Math.min(W / img_w, H / img_h);
+    var h_pad = (W - img_w * scale) / 2;
+    var v_pad = (H - img_h * scale) / 2;
     var img_x = (tap_x - h_pad) / scale;
     var img_y = (tap_y - v_pad) / scale;
 
@@ -525,24 +396,27 @@ function exit_zoom() {
 
 function enter_zoom_at_fit() {
     if (zoom_mode || current_index === null) return;
-    var img = image_cache[images[current_index]];
-    if (!img || !img.complete || img.naturalWidth === 0) return;
+    var img_w = renderer.image_width(current_index);
+    var img_h = renderer.image_height(current_index);
+    if (!img_w || !img_h) return;
     var photo_box = document.getElementById('lobjet_pane');
     var W = photo_box.clientWidth;
     var H = photo_box.clientHeight;
-    zoom_scale = Math.min(W / img.naturalWidth, H / img.naturalHeight);
+    zoom_scale = Math.min(W / img_w, H / img_h);
     zoom_pan_x = 0;
     zoom_pan_y = 0;
     zoom_mode  = true;
 }
 
 function apply_zoom(factor, pivot_x, pivot_y) {
-    var img = image_cache[images[current_index]];
-    if (!img) return;
+    if (current_index === null) return;
+    var img_w = renderer.image_width(current_index);
+    var img_h = renderer.image_height(current_index);
+    if (!img_w || !img_h) return;
     var photo_box = document.getElementById('lobjet_pane');
     var W = photo_box.clientWidth;
     var H = photo_box.clientHeight;
-    var fit_scale = Math.min(W / img.naturalWidth, H / img.naturalHeight);
+    var fit_scale = Math.min(W / img_w, H / img_h);
     var new_scale = zoom_scale * factor;
     if (new_scale <= fit_scale) { exit_zoom(); return; }
     new_scale = Math.min(ZOOM_MAX, new_scale);
@@ -551,7 +425,7 @@ function apply_zoom(factor, pivot_x, pivot_y) {
     zoom_pan_y += pivot_y / zoom_scale - pivot_y / new_scale;
     zoom_scale  = new_scale;
     clamp_pan();
-    draw_zoomed();
+    draw(0);
 }
 
 // ---------------------------------------------------------------------------
@@ -619,7 +493,7 @@ function pointer_move(x, y) {
 
     var raw = x - drag_start_x;
     if (raw > 0 && current_index === 0) raw = 0;
-    if (raw < 0 && current_index === images.length - 1) raw = 0;
+    if (raw < 0 && current_index === renderer.image_count() - 1) raw = 0;
     drag_offset = raw;
     if (Math.abs(drag_offset) > 5) drag_moved = true;
     draw(drag_offset);
@@ -655,7 +529,7 @@ function pointer_end() {
             set_current_index(current_index - 1);
             draw(0);
         });
-    } else if (saved < -threshold && current_index < images.length - 1) {
+    } else if (saved < -threshold && current_index < renderer.image_count() - 1) {
         animate_slide(saved, -W, function() {
             set_current_index(current_index + 1);
             draw(0);
@@ -672,7 +546,7 @@ function pointer_end() {
 function advance() {
     zoom_mode = false;
     var i = current_index + 1;
-    if (i >= images.length) i = 0;
+    if (i >= renderer.image_count()) i = 0;
     set_current_index(i);
     draw(0);
     refresh_hover();
@@ -681,7 +555,7 @@ function advance() {
 function retreat() {
     zoom_mode = false;
     var i = current_index - 1;
-    if (i < 0) i = images.length - 1;
+    if (i < 0) i = renderer.image_count() - 1;
     set_current_index(i);
     draw(0);
     refresh_hover();
@@ -700,18 +574,18 @@ function keydown(event) {
     }
     if (event.key === 'i' || event.key === 'I') { show_info(); return; }
     if (event.key === 'ArrowRight' || event.key === 'Right') {
-        if (zoom_mode) { zoom_pan_x += ARROW_PAN_PX / zoom_scale; clamp_pan(); draw_zoomed(); }
+        if (zoom_mode) { zoom_pan_x += ARROW_PAN_PX / zoom_scale; clamp_pan(); draw(0); }
         else advance();
     }
     else if (event.key === 'ArrowLeft' || event.key === 'Left') {
-        if (zoom_mode) { zoom_pan_x -= ARROW_PAN_PX / zoom_scale; clamp_pan(); draw_zoomed(); }
+        if (zoom_mode) { zoom_pan_x -= ARROW_PAN_PX / zoom_scale; clamp_pan(); draw(0); }
         else retreat();
     }
     else if (event.key === 'ArrowDown' || event.key === 'Down') {
-        if (zoom_mode) { zoom_pan_y += ARROW_PAN_PX / zoom_scale; clamp_pan(); draw_zoomed(); }
+        if (zoom_mode) { zoom_pan_y += ARROW_PAN_PX / zoom_scale; clamp_pan(); draw(0); }
     }
     else if (event.key === 'ArrowUp' || event.key === 'Up') {
-        if (zoom_mode) { zoom_pan_y -= ARROW_PAN_PX / zoom_scale; clamp_pan(); draw_zoomed(); }
+        if (zoom_mode) { zoom_pan_y -= ARROW_PAN_PX / zoom_scale; clamp_pan(); draw(0); }
     }
     else if (event.key === '0') {
         if (zoom_mode) exit_zoom();
@@ -802,12 +676,13 @@ function init() {
             var dy = t1.clientY - t0.clientY;
             var dist = Math.sqrt(dx*dx + dy*dy);
             if (pinch_start_dist > 0) {
-                var img = image_cache[images[current_index]];
-                if (img) {
+                var img_w = renderer.image_width(current_index);
+                var img_h = renderer.image_height(current_index);
+                if (img_w && img_h) {
                     var photo_box = document.getElementById('lobjet_pane');
                     var W = photo_box.clientWidth;
                     var H = photo_box.clientHeight;
-                    var fit_scale = Math.min(W / img.naturalWidth, H / img.naturalHeight);
+                    var fit_scale = Math.min(W / img_w, H / img_h);
                     var raw_scale = pinch_start_scale * dist / pinch_start_dist;
                     if (raw_scale <= fit_scale) { exit_zoom(); pinch_active = false; return; }
                     var new_scale = Math.min(ZOOM_MAX, raw_scale);
@@ -817,7 +692,7 @@ function init() {
                     zoom_pan_y = img_mid_y - pinch_mid_y / new_scale;
                     zoom_scale = new_scale;
                     clamp_pan();
-                    draw_zoomed();
+                    draw(0);
                 }
             }
         } else {
@@ -885,7 +760,7 @@ function init() {
         var now_landscape = landscape_mq.matches;
         if (now_landscape !== last_landscape) {
             last_landscape = now_landscape;
-            if (images.length === 0) return;
+            if (renderer.image_count() === 0) return;
             var saved = current_index;
             current_index = null;
             var header = document.getElementById('header_container');

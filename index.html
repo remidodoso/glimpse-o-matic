@@ -1,18 +1,23 @@
 <html> <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <!-- Build 0531:2118 -->
+    <!-- Build 0602:1000 -->
  
     <script type="module">
-        import init, { xor_decode, GlimrZip } from './pkg/glimr.js';
+        import init, { xor_decode, GlimrRenderer, glimr_log } from './pkg/glimr.js';
         await init();
-        window.glimr = { xor_decode, GlimrZip };
+        window.glimr = { xor_decode, GlimrRenderer, glimr_log };
+        window.renderer = new GlimrRenderer(
+            document.getElementById('photo'),
+            document.getElementById('backing')
+        );
+        window.init();
     </script>
     <script type="text/javascript" src="main.js"></script>
     <link rel="stylesheet" href="main.css">
 </head>
 
-<body onload="init(); draw();">
+<body>
     <div class="main-container">
         <div class="header" id="header_container">
         </div>
