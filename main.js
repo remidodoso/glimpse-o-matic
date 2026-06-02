@@ -18,6 +18,7 @@ var landscape_mq = window.matchMedia('(orientation: landscape)');
 var thumbs = [];
 var current_index = null;
 var thumb_gen = 0;  // incremented on each load; cancels stale thumbnail fills
+var load_gen  = 0;  // incremented on each load; cancels stale extraction rAF loops
 
 // Slide drag state
 var is_dragging = false;
@@ -124,14 +125,32 @@ function toggle_fullscreen() {
 function download_current() {
     if (current_index === null) return;
     var bytes = renderer.raw_bytes(current_index);
-    var url = URL.createObjectURL(new Blob([bytes], {type: 'image/jpeg'}));
-    var a = document.createElement('a');
-    a.href = url;
-    a.download = renderer.image_name(current_index).replace(/\.dat$/i, '.jpg');
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    var name  = renderer.image_name(current_index).replace(/\.dat$/i, '.jpg');
+    var blob  = new Blob([bytes], {type: 'image/jpeg'});
+
+    if (!window.showSaveFilePicker) {
+        if (!window.confirm(name + '\n' + format_size(blob.size))) return;
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = name;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        return;
+    }
+
+    window.showSaveFilePicker({
+        suggestedName: name,
+        types: [{ description: 'JPEG Image', accept: {'image/jpeg': ['.jpg', '.jpeg']} }]
+    }).then(function(handle) {
+        return handle.createWritable();
+    }).then(function(writable) {
+        return writable.write(blob).then(function() { return writable.close(); });
+    }).catch(function(e) {
+        if (e.name !== 'AbortError') glimr_log('download_current', 'save error: ' + e);
+    });
 }
 
 function load_zip(buf) {
@@ -153,15 +172,41 @@ function load_zip(buf) {
     header.innerHTML = '';
     thumbs = [];
 
-    glimr_log('load_zip', 'renderer.load_zip start (' + buf.byteLength + ' bytes)');
-    renderer.load_zip(new Uint8Array(buf));
-    glimr_log('load_zip', 'renderer.load_zip done');
-    create_thumbnails();
-    set_current_index(0);
-    if (loading) loading.style.display = 'none';
-    glimr_log('load_zip', 'calling draw(0)');
-    draw(0);
-    glimr_log('load_zip', 'done');
+    // Reset progress bar, hide any previous error.
+    var fill   = document.getElementById('progress-fill');
+    var track  = document.getElementById('progress-track');
+    var errDiv = document.getElementById('progress-error');
+    if (fill)   fill.style.width   = '0%';
+    if (track)  track.style.display = '';
+    if (errDiv) errDiv.style.display = 'none';
+
+    var gen   = ++load_gen;
+    var total = renderer.begin_zip_load(new Uint8Array(buf));
+    glimr_log('load_zip', 'begin_zip_load (' + buf.byteLength + ' bytes)');
+
+    function step() {
+        if (gen !== load_gen) return;
+        try {
+            var done = renderer.load_next_entry();
+            if (fill && total > 0)
+                fill.style.width = Math.round(renderer.load_bytes_done() / total * 100) + '%';
+            if (done) {
+                renderer.finish_zip_load();
+                glimr_log('load_zip', 'finish_zip_load done');
+                create_thumbnails();
+                if (loading) loading.style.display = 'none';
+                navigate_to(0);
+                glimr_log('load_zip', 'done');
+            } else {
+                requestAnimationFrame(step);
+            }
+        } catch (e) {
+            glimr_log('load_zip', 'error: ' + e);
+            if (track)  track.style.display  = 'none';
+            if (errDiv) { errDiv.textContent = String(e); errDiv.style.display = ''; }
+        }
+    }
+    requestAnimationFrame(step);
 }
 
 // ---------------------------------------------------------------------------
@@ -183,6 +228,17 @@ function create_loading_screen() {
         });
         div.appendChild(line);
     });
+
+    var track = document.createElement('div');
+    track.id = 'progress-track';
+    var fill = document.createElement('div');
+    fill.id = 'progress-fill';
+    track.appendChild(fill);
+    div.appendChild(track);
+
+    var errDiv = document.createElement('div');
+    errDiv.id = 'progress-error';
+    div.appendChild(errDiv);
 }
 
 // ---------------------------------------------------------------------------
@@ -199,11 +255,10 @@ function create_thumbnails() {
     var gen = ++thumb_gen;
 
     for (let i = 0; i < count; i++) {
-        var canvas = document.createElement("canvas");
+        let canvas = document.createElement('canvas');
         canvas.width  = 0;
         canvas.height = 0;
-        canvas.dataset.imageNumber = i;
-        var divbox = document.createElement('DIV');
+        let divbox = document.createElement('div');
         divbox.appendChild(canvas);
         header_container.appendChild(divbox);
         thumbs.push(canvas);
@@ -213,21 +268,25 @@ function create_thumbnails() {
         canvas.style.margin = '4px';
         canvas.addEventListener('click', function() {
             if (carousel_drag_moved) { carousel_drag_moved = false; return; }
-            set_current_index(parseInt(canvas.dataset.imageNumber));
-            draw(0);
+            navigate_to(i);
+        });
+
+        // Fire all thumbnail decodes concurrently — browser resolves as ready.
+        var bytes = renderer.get_image_bytes(i);
+        createImageBitmap(new Blob([bytes])).then(function(bitmap) {
+            if (gen !== thumb_gen) { bitmap.close(); return; }
+            var vert = landscape_mq.matches;
+            var scale = vert ? carousel_size / bitmap.width : carousel_size / bitmap.height;
+            var tw = Math.round(bitmap.width  * scale);
+            var th = Math.round(bitmap.height * scale);
+            canvas.width  = tw;
+            canvas.height = th;
+            canvas.getContext('2d').drawImage(bitmap, 0, 0, tw, th);
+            bitmap.close();
+        }).catch(function(e) {
+            glimr_log('create_thumbnails', 'thumb ' + i + ' error: ' + e);
         });
     }
-
-    // Decode and render thumbnails one per animation frame, starting after
-    // the first draw() so the main image appears before thumbnail work begins.
-    // The gen check cancels this fill if load_zip is called again.
-    requestAnimationFrame(function fill(i) {
-        if (gen !== thumb_gen || i >= thumbs.length) return;
-        glimr_log('create_thumbnails', 'draw_thumbnail start ' + i);
-        renderer.draw_thumbnail(thumbs[i], i, carousel_size, landscape_mq.matches);
-        glimr_log('create_thumbnails', 'draw_thumbnail done  ' + i);
-        requestAnimationFrame(function() { fill(i + 1); });
-    }.bind(null, 0));
 }
 
 function scroll_carousel_to(index) {
@@ -269,6 +328,39 @@ function set_current_index(new_index) {
     thumbs[current_index].style.opacity = '75%';
     thumbs[current_index].style.filter = 'brightness(75%)';
     scroll_carousel_to(new_index);
+}
+
+// Decode image `index` via browser createImageBitmap → WASM receive_pixels.
+// Calls callback() when done, or immediately if already cached.
+function decode_image(index, callback) {
+    if (renderer.is_decoded(index)) {
+        if (callback) callback();
+        return;
+    }
+    var bytes = renderer.get_image_bytes(index);
+    createImageBitmap(new Blob([bytes])).then(function(bitmap) {
+        var oc = new OffscreenCanvas(bitmap.width, bitmap.height);
+        var ctx = oc.getContext('2d');
+        ctx.drawImage(bitmap, 0, 0);
+        var pixels = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
+        renderer.receive_pixels(index, bitmap.width, bitmap.height, pixels.data);
+        bitmap.close();
+        if (callback) callback();
+    }).catch(function(e) {
+        glimr_log('decode_image', 'error ' + index + ': ' + e);
+    });
+}
+
+// Select image `index`: update thumbnail highlight, decode if needed, draw,
+// then prefetch immediate neighbours for snappy swipe transitions.
+function navigate_to(index) {
+    set_current_index(index);
+    decode_image(index, function() {
+        draw(0);
+        var count = renderer.image_count();
+        if (index > 0)         decode_image(index - 1, null);
+        if (index + 1 < count) decode_image(index + 1, null);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -526,13 +618,11 @@ function pointer_end() {
 
     if (saved > threshold && current_index > 0) {
         animate_slide(saved, W, function() {
-            set_current_index(current_index - 1);
-            draw(0);
+            navigate_to(current_index - 1);
         });
     } else if (saved < -threshold && current_index < renderer.image_count() - 1) {
         animate_slide(saved, -W, function() {
-            set_current_index(current_index + 1);
-            draw(0);
+            navigate_to(current_index + 1);
         });
     } else {
         animate_slide(saved, 0, null);
@@ -547,8 +637,7 @@ function advance() {
     zoom_mode = false;
     var i = current_index + 1;
     if (i >= renderer.image_count()) i = 0;
-    set_current_index(i);
-    draw(0);
+    navigate_to(i);
     refresh_hover();
 }
 
@@ -556,8 +645,7 @@ function retreat() {
     zoom_mode = false;
     var i = current_index - 1;
     if (i < 0) i = renderer.image_count() - 1;
-    set_current_index(i);
-    draw(0);
+    navigate_to(i);
     refresh_hover();
 }
 

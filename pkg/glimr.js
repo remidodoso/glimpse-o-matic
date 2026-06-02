@@ -12,6 +12,18 @@ export class GlimrRenderer {
         wasm.__wbg_glimrrenderer_free(ptr, 0);
     }
     /**
+     * Stores the zip bytes and resets parse state. Returns total byte count
+     * so JS can compute progress as load_bytes_done() / total.
+     * @param {Uint8Array} zip_bytes
+     * @returns {number}
+     */
+    begin_zip_load(zip_bytes) {
+        const ptr0 = passArray8ToWasm0(zip_bytes, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.glimrrenderer_begin_zip_load(this.__wbg_ptr, ptr0, len0);
+        return ret >>> 0;
+    }
+    /**
      * Draw image at `index` onto the photo canvas.
      * `offset` is the slide drag offset in CSS pixels:
      *   > 0 → dragging right (prev image enters from left)
@@ -43,22 +55,6 @@ export class GlimrRenderer {
         }
     }
     /**
-     * Draws a thumbnail for image `index` into a caller-supplied canvas element.
-     * Sets canvas width/height to match the scaled dimensions, then blits.
-     * `carousel_size` — target size in CSS px on the constrained axis.
-     * `fit_to_width`  — true in landscape (vertical strip); false in portrait (horizontal strip).
-     * @param {HTMLCanvasElement} canvas
-     * @param {number} index
-     * @param {number} carousel_size
-     * @param {boolean} fit_to_width
-     */
-    draw_thumbnail(canvas, index, carousel_size, fit_to_width) {
-        const ret = wasm.glimrrenderer_draw_thumbnail(this.__wbg_ptr, canvas, index, carousel_size, fit_to_width);
-        if (ret[1]) {
-            throw takeFromExternrefTable0(ret[0]);
-        }
-    }
-    /**
      * Renders image `index` in zoom/pan mode.
      * `scale`  — zoom factor (1.0 = 1:1 pixels, fit_scale = fully zoomed out)
      * `pan_x/y` — top-left corner of the viewport window in image-space pixels
@@ -72,6 +68,27 @@ export class GlimrRenderer {
         if (ret[1]) {
             throw takeFromExternrefTable0(ret[0]);
         }
+    }
+    /**
+     * Sorts accumulated entries, populates names/image_bytes, frees the
+     * buffered zip bytes. Call once load_next_entry returns Ok(true).
+     */
+    finish_zip_load() {
+        const ret = wasm.glimrrenderer_finish_zip_load(this.__wbg_ptr);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
+     * Returns the raw (XOR-decoded) bytes for image i as a Uint8Array.
+     * JS passes these to createImageBitmap; the Blob is transient and never
+     * stored as an accessible object.
+     * @param {number} i
+     * @returns {Uint8Array}
+     */
+    get_image_bytes(i) {
+        const ret = wasm.glimrrenderer_get_image_bytes(this.__wbg_ptr, i);
+        return ret;
     }
     /**
      * @returns {number}
@@ -124,6 +141,37 @@ export class GlimrRenderer {
         return ret >>> 0;
     }
     /**
+     * Returns true if image i has been decoded and cached.
+     * @param {number} i
+     * @returns {boolean}
+     */
+    is_decoded(i) {
+        const ret = wasm.glimrrenderer_is_decoded(this.__wbg_ptr, i);
+        return ret !== 0;
+    }
+    /**
+     * Current byte position in the pending zip; divide by begin_zip_load's
+     * return value to get extraction progress (0.0–1.0).
+     * @returns {number}
+     */
+    load_bytes_done() {
+        const ret = wasm.glimrrenderer_load_bytes_done(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * Parses one local file header. Returns Ok(false) while entries remain,
+     * Ok(true) when the central directory is reached or the buffer is exhausted,
+     * Err if the zip is malformed or unsupported.
+     * @returns {boolean}
+     */
+    load_next_entry() {
+        const ret = wasm.glimrrenderer_load_next_entry(this.__wbg_ptr);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return ret[0] !== 0;
+    }
+    /**
      * @param {Uint8Array} zip_bytes
      */
     load_zip(zip_bytes) {
@@ -158,6 +206,23 @@ export class GlimrRenderer {
         var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
         wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
         return v1;
+    }
+    /**
+     * Stores watermarked RGBA pixels for image i. Called by JS after
+     * createImageBitmap → OffscreenCanvas → getImageData. Watermark
+     * is applied here before caching.
+     * @param {number} i
+     * @param {number} width
+     * @param {number} height
+     * @param {Uint8Array} data
+     */
+    receive_pixels(i, width, height, data) {
+        const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.glimrrenderer_receive_pixels(this.__wbg_ptr, i, width, height, ptr0, len0);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
     }
 }
 if (Symbol.dispose) GlimrRenderer.prototype[Symbol.dispose] = GlimrRenderer.prototype.free;
@@ -283,6 +348,10 @@ function __wbg_get_imports() {
         },
         __wbg_new_0_445c13a750296eb6: function() {
             const ret = new Date();
+            return ret;
+        },
+        __wbg_new_from_slice_18fa1f71286d66b8: function(arg0, arg1) {
+            const ret = new Uint8Array(getArrayU8FromWasm0(arg0, arg1));
             return ret;
         },
         __wbg_new_with_u8_clamped_array_and_sh_e3609225f4ad3a74: function() { return handleError(function (arg0, arg1, arg2, arg3) {

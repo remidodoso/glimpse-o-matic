@@ -1,8 +1,8 @@
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{Clamped, JsCast};
 use std::collections::HashMap;
-use std::io::{Cursor, Read};
-use zip::ZipArchive;
+use std::io::Read;
+use flate2::read::DeflateDecoder;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, ImageData};
 
 const XOR_KEY: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
@@ -55,6 +55,88 @@ pub fn xor_decode(input: &[u8]) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// Streaming zip parser — reads local file headers sequentially from byte 0.
+// Errors out on data descriptors (bit 3), zip64, unknown compression, or a
+// bad signature. Windows Explorer and packg zips are always compatible.
+// ---------------------------------------------------------------------------
+
+fn parse_zip_streaming(data: &[u8]) -> Result<Vec<(String, Vec<u8>)>, JsValue> {
+    let mut pos = 0;
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+
+    loop {
+        if pos + 4 > data.len() { break; }
+
+        let sig = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+        match sig {
+            0x04034b50 => {
+                if pos + 30 > data.len() {
+                    return Err(JsValue::from_str("truncated local file header"));
+                }
+
+                let flags       = u16::from_le_bytes(data[pos +  6..pos +  8].try_into().unwrap());
+                let compression = u16::from_le_bytes(data[pos +  8..pos + 10].try_into().unwrap());
+                let comp_size   = u32::from_le_bytes(data[pos + 18..pos + 22].try_into().unwrap());
+                let fname_len   = u16::from_le_bytes(data[pos + 26..pos + 28].try_into().unwrap()) as usize;
+                let extra_len   = u16::from_le_bytes(data[pos + 28..pos + 30].try_into().unwrap()) as usize;
+
+                if flags & 0x0008 != 0 {
+                    return Err(JsValue::from_str(
+                        "zip uses data descriptors — not supported. Try a zip created by Windows or macOS."
+                    ));
+                }
+                if comp_size == 0xFFFF_FFFF {
+                    return Err(JsValue::from_str("zip64 format is not supported."));
+                }
+                if compression != 0 && compression != 8 {
+                    return Err(JsValue::from_str(&format!(
+                        "unsupported compression method {compression} — only stored and deflate are supported."
+                    )));
+                }
+
+                let data_start = pos + 30 + fname_len + extra_len;
+                let data_end   = data_start + comp_size as usize;
+                if data_end > data.len() {
+                    return Err(JsValue::from_str("truncated entry data"));
+                }
+
+                let name = String::from_utf8_lossy(&data[pos + 30..pos + 30 + fname_len]).into_owned();
+                let compressed = &data[data_start..data_end];
+                pos = data_end;
+
+                if name.ends_with('/') || !is_image_ext(&name) { continue; }
+
+                let raw: Vec<u8> = match compression {
+                    0 => compressed.to_vec(),
+                    8 => {
+                        let mut out = Vec::new();
+                        DeflateDecoder::new(compressed).read_to_end(&mut out)
+                            .map_err(|e| JsValue::from_str(&format!("deflate error: {e}")))?;
+                        out
+                    }
+                    _ => unreachable!(),
+                };
+
+                let decoded = if name.to_lowercase().ends_with(".dat") {
+                    xor_bytes(&raw)
+                } else {
+                    raw
+                };
+
+                entries.push((name, decoded));
+            }
+            0x02014b50 | 0x06054b50 => break, // central directory or EOCD — done
+            _ => return Err(JsValue::from_str(&format!(
+                "unrecognised zip signature 0x{sig:08x} at offset {pos} — file may be corrupted or an unsupported format."
+            ))),
+        }
+    }
+
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(entries)
+}
+
+// ---------------------------------------------------------------------------
 // GlimrRenderer — Phase 2+: WASM-side canvas rendering
 // ---------------------------------------------------------------------------
 
@@ -74,6 +156,10 @@ pub struct GlimrRenderer {
     canvas: HtmlCanvasElement,   // #photo
     backing: HtmlCanvasElement,  // #backing
     decode: HtmlCanvasElement,   // hidden, used to scale-blit decoded images
+    // Incremental load state — active between begin_zip_load and finish_zip_load
+    pending_zip:     Vec<u8>,
+    pending_pos:     usize,
+    pending_entries: Vec<(String, Vec<u8>)>,
 }
 
 #[wasm_bindgen]
@@ -94,39 +180,142 @@ impl GlimrRenderer {
             canvas,
             backing,
             decode,
+            pending_zip:     Vec::new(),
+            pending_pos:     0,
+            pending_entries: Vec::new(),
         })
     }
 
     pub fn load_zip(&mut self, zip_bytes: &[u8]) -> Result<(), JsValue> {
         glog("load_zip", &format!("start ({} bytes)", zip_bytes.len()));
-        let cursor = Cursor::new(zip_bytes);
-        let mut archive = ZipArchive::new(cursor)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
-        for i in 0..archive.len() {
-            let mut file = archive.by_index(i)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            if file.is_dir() { continue; }
-            let name = file.name().to_string();
-            if !is_image_ext(&name) { continue; }
-            let mut raw = Vec::new();
-            file.read_to_end(&mut raw)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let decoded = if name.to_lowercase().ends_with(".dat") {
-                xor_bytes(&raw)
-            } else {
-                raw
-            };
-            entries.push((name, decoded));
-        }
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-
+        let entries = parse_zip_streaming(zip_bytes)?;
         self.pixel_cache.clear();
         self.names       = entries.iter().map(|(n, _)| n.clone()).collect();
         self.image_bytes = entries.into_iter().map(|(_, b)| b).collect();
-
         glog("load_zip", &format!("done — {} images loaded", self.names.len()));
+        Ok(())
+    }
+
+    // --- Incremental load API (used by JS rAF loop for progress reporting) ---
+
+    /// Stores the zip bytes and resets parse state. Returns total byte count
+    /// so JS can compute progress as load_bytes_done() / total.
+    pub fn begin_zip_load(&mut self, zip_bytes: &[u8]) -> u32 {
+        glog("begin_zip_load", &format!("start ({} bytes)", zip_bytes.len()));
+        self.pending_zip = zip_bytes.to_vec();
+        self.pending_pos = 0;
+        self.pending_entries.clear();
+        zip_bytes.len() as u32
+    }
+
+    /// Parses one local file header. Returns Ok(false) while entries remain,
+    /// Ok(true) when the central directory is reached or the buffer is exhausted,
+    /// Err if the zip is malformed or unsupported.
+    pub fn load_next_entry(&mut self) -> Result<bool, JsValue> {
+        let pos = self.pending_pos;
+
+        if pos + 4 > self.pending_zip.len() {
+            return Ok(true);
+        }
+
+        let sig = u32::from_le_bytes(self.pending_zip[pos..pos + 4].try_into().unwrap());
+        match sig {
+            0x04034b50 => {
+                // Parse the header and decompress the entry inside a block so the
+                // immutable borrow of self.pending_zip ends before we mutate self.
+                let (new_pos, maybe_entry): (usize, Option<(String, Vec<u8>)>) = {
+                    let data = &self.pending_zip;
+
+                    if pos + 30 > data.len() {
+                        return Err(JsValue::from_str("truncated local file header"));
+                    }
+
+                    let flags       = u16::from_le_bytes(data[pos +  6..pos +  8].try_into().unwrap());
+                    let compression = u16::from_le_bytes(data[pos +  8..pos + 10].try_into().unwrap());
+                    let comp_size   = u32::from_le_bytes(data[pos + 18..pos + 22].try_into().unwrap());
+                    let fname_len   = u16::from_le_bytes(data[pos + 26..pos + 28].try_into().unwrap()) as usize;
+                    let extra_len   = u16::from_le_bytes(data[pos + 28..pos + 30].try_into().unwrap()) as usize;
+
+                    if flags & 0x0008 != 0 {
+                        return Err(JsValue::from_str(
+                            "zip uses data descriptors — not supported. Try a zip created by Windows or macOS."
+                        ));
+                    }
+                    if comp_size == 0xFFFF_FFFF {
+                        return Err(JsValue::from_str("zip64 format is not supported."));
+                    }
+                    if compression != 0 && compression != 8 {
+                        return Err(JsValue::from_str(&format!(
+                            "unsupported compression method {compression} — only stored and deflate are supported."
+                        )));
+                    }
+
+                    let data_start = pos + 30 + fname_len + extra_len;
+                    let data_end   = data_start + comp_size as usize;
+                    if data_end > data.len() {
+                        return Err(JsValue::from_str("truncated entry data"));
+                    }
+
+                    let name = String::from_utf8_lossy(&data[pos + 30..pos + 30 + fname_len]).into_owned();
+
+                    let entry = if !name.ends_with('/') && is_image_ext(&name) {
+                        let compressed = &data[data_start..data_end];
+                        let raw: Vec<u8> = match compression {
+                            0 => compressed.to_vec(),
+                            8 => {
+                                let mut out = Vec::new();
+                                DeflateDecoder::new(compressed).read_to_end(&mut out)
+                                    .map_err(|e| JsValue::from_str(&format!("deflate error: {e}")))?;
+                                out
+                            }
+                            _ => unreachable!(),
+                        };
+                        let decoded = if name.to_lowercase().ends_with(".dat") {
+                            xor_bytes(&raw)
+                        } else {
+                            raw
+                        };
+                        Some((name, decoded))
+                    } else {
+                        None
+                    };
+
+                    (data_end, entry)
+                };
+
+                self.pending_pos = new_pos;
+                if let Some(e) = maybe_entry {
+                    self.pending_entries.push(e);
+                }
+                Ok(false)
+            }
+            0x02014b50 | 0x06054b50 => {
+                self.pending_pos = self.pending_zip.len();
+                glog("load_next_entry", &format!("done — {} image entries", self.pending_entries.len()));
+                Ok(true)
+            }
+            _ => Err(JsValue::from_str(&format!(
+                "unrecognised zip signature 0x{sig:08x} at offset {pos} — file may be corrupted or unsupported."
+            ))),
+        }
+    }
+
+    /// Current byte position in the pending zip; divide by begin_zip_load's
+    /// return value to get extraction progress (0.0–1.0).
+    pub fn load_bytes_done(&self) -> u32 {
+        self.pending_pos as u32
+    }
+
+    /// Sorts accumulated entries, populates names/image_bytes, frees the
+    /// buffered zip bytes. Call once load_next_entry returns Ok(true).
+    pub fn finish_zip_load(&mut self) -> Result<(), JsValue> {
+        let mut entries = std::mem::take(&mut self.pending_entries);
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        self.pixel_cache.clear();
+        self.names       = entries.iter().map(|(n, _)| n.clone()).collect();
+        self.image_bytes = entries.into_iter().map(|(_, b)| b).collect();
+        self.pending_zip = Vec::new();
+        glog("finish_zip_load", &format!("done — {} images", self.names.len()));
         Ok(())
     }
 
@@ -157,6 +346,28 @@ impl GlimrRenderer {
     /// Size of the stored (XOR-decoded) JPEG/PNG bytes for image i.
     pub fn image_file_size(&self, i: usize) -> usize {
         self.image_bytes[i].len()
+    }
+
+    /// Returns the raw (XOR-decoded) bytes for image i as a Uint8Array.
+    /// JS passes these to createImageBitmap; the Blob is transient and never
+    /// stored as an accessible object.
+    pub fn get_image_bytes(&self, i: usize) -> js_sys::Uint8Array {
+        js_sys::Uint8Array::from(self.image_bytes[i].as_slice())
+    }
+
+    /// Stores watermarked RGBA pixels for image i. Called by JS after
+    /// createImageBitmap → OffscreenCanvas → getImageData. Watermark
+    /// is applied here before caching.
+    pub fn receive_pixels(&mut self, i: usize, width: u32, height: u32, data: &[u8]) -> Result<(), JsValue> {
+        // TODO: apply spread-spectrum watermark here
+        glog("receive_pixels", &format!("image {} {}×{}", i, width, height));
+        self.pixel_cache.insert(i, (width, height, data.to_vec()));
+        Ok(())
+    }
+
+    /// Returns true if image i has been decoded and cached.
+    pub fn is_decoded(&self, i: usize) -> bool {
+        self.pixel_cache.contains_key(&i)
     }
 
     /// Draw image at `index` onto the photo canvas.
@@ -207,11 +418,9 @@ impl GlimrRenderer {
         let h = self.canvas.client_height() as u32;
         if w == 0 || h == 0 { return Ok(()); }
 
-        self.ensure_decoded(index)?;
-
-        let (img_w, img_h) = {
-            let e = self.pixel_cache.get(&index).unwrap();
-            (e.0, e.1)
+        let (img_w, img_h) = match self.pixel_cache.get(&index) {
+            Some(e) => (e.0, e.1),
+            None => return Ok(()),
         };
 
         let wf = w as f64;
@@ -257,51 +466,6 @@ impl GlimrRenderer {
             .map_err(|e| e)
     }
 
-    /// Draws a thumbnail for image `index` into a caller-supplied canvas element.
-    /// Sets canvas width/height to match the scaled dimensions, then blits.
-    /// `carousel_size` — target size in CSS px on the constrained axis.
-    /// `fit_to_width`  — true in landscape (vertical strip); false in portrait (horizontal strip).
-    pub fn draw_thumbnail(
-        &mut self,
-        canvas: HtmlCanvasElement,
-        index: usize,
-        carousel_size: f64,
-        fit_to_width: bool,
-    ) -> Result<(), JsValue> {
-        self.ensure_decoded(index)?;
-
-        let (img_w, img_h) = {
-            let e = self.pixel_cache.get(&index).unwrap();
-            (e.0, e.1)
-        };
-
-        let iw = img_w as f64;
-        let ih = img_h as f64;
-        let scale = if fit_to_width { carousel_size / iw } else { carousel_size / ih };
-        let thumb_w = (iw * scale).round() as u32;
-        let thumb_h = (ih * scale).round() as u32;
-
-        canvas.set_width(thumb_w);
-        canvas.set_height(thumb_h);
-        let ctx = get_2d_context(&canvas)?;
-
-        glog("draw_thumbnail", &format!("resize start image {} {}×{} → {}×{}", index, img_w, img_h, thumb_w, thumb_h));
-        let thumb_pixels = {
-            let pixels = &self.pixel_cache[&index].2;
-            let src = image::ImageBuffer::<image::Rgba<u8>, &[u8]>::from_raw(img_w, img_h, pixels.as_slice())
-                .ok_or_else(|| JsValue::from_str("thumbnail: bad pixel cache"))?;
-            image::imageops::resize(&src, thumb_w, thumb_h, image::imageops::FilterType::Triangle)
-        };
-        glog("draw_thumbnail", &format!("resize done  image {}", index));
-
-        let img_data = ImageData::new_with_u8_clamped_array_and_sh(
-            Clamped(thumb_pixels.as_raw().as_slice()), thumb_w, thumb_h
-        )?;
-        ctx.put_image_data(&img_data, 0.0, 0.0)?;
-        glog("draw_thumbnail", &format!("put_image_data done image {}", index));
-        Ok(())
-    }
-
     /// Draws the `<` / `>` hover arrow directly onto `self.canvas` (on top of the blitted image).
     /// `zone`    — "left", "right", or "" (no-op).
     /// `opacity` — current animation opacity (0.0–1.0); no-op if ≤ 0.
@@ -336,6 +500,7 @@ impl GlimrRenderer {
     }
 
     // Fit-scales image `index` into the column starting at `col_x` with dimensions `col_w × col_h`.
+    // If the image has not yet been decoded, draws a grey placeholder and returns.
     fn draw_image_in_column(
         &mut self,
         ctx: &CanvasRenderingContext2d,
@@ -344,12 +509,13 @@ impl GlimrRenderer {
         col_w: f64,
         col_h: f64,
     ) -> Result<(), JsValue> {
-        self.ensure_decoded(index)?;
-
-        // Extract dimensions without holding a borrow into pixel_cache across the canvas calls.
-        let (img_w, img_h) = {
-            let e = self.pixel_cache.get(&index).unwrap();
-            (e.0, e.1)
+        let (img_w, img_h) = match self.pixel_cache.get(&index) {
+            Some(e) => (e.0, e.1),
+            None => {
+                ctx.set_fill_style_str("#777777");
+                ctx.fill_rect(col_x, 0.0, col_w, col_h);
+                return Ok(());
+            }
         };
 
         let iw = img_w as f64;
@@ -383,17 +549,4 @@ impl GlimrRenderer {
         .map_err(|e| e)
     }
 
-    fn ensure_decoded(&mut self, index: usize) -> Result<(), JsValue> {
-        if self.pixel_cache.contains_key(&index) {
-            return Ok(());
-        }
-        glog("ensure_decoded", &format!("start image {} ({} bytes)", index, self.image_bytes[index].len()));
-        let img = image::load_from_memory(&self.image_bytes[index])
-            .map_err(|e| JsValue::from_str(&format!("decode error: {e}")))?;
-        let rgba = img.to_rgba8();
-        let (w, h) = rgba.dimensions();
-        glog("ensure_decoded", &format!("done  image {} → {}×{}", index, w, h));
-        self.pixel_cache.insert(index, (w, h, rgba.into_raw()));
-        Ok(())
-    }
 }

@@ -203,6 +203,32 @@ div.gallery {
     animation: wave-bounce 1.1s ease-in-out infinite;
 }
 
+#progress-track {
+    width: 50vw;
+    max-width: 400px;
+    height: 8px;
+    background: rgba(255, 255, 255, 0.2);
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+#progress-fill {
+    height: 100%;
+    width: 0%;
+    background: rgba(255, 255, 255, 0.7);
+    border-radius: 4px;
+    transition: width 0.1s ease-out;
+}
+
+#progress-error {
+    color: #faa;
+    font-size: clamp(12px, 1.5vw, 18px);
+    max-width: 50vw;
+    text-align: center;
+    padding: 0.5em 1em;
+    display: none;
+}
+
 #button-bar {
     position: fixed;
     bottom: 16px;

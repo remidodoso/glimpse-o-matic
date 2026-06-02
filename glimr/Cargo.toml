@@ -8,8 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 wasm-bindgen = "0.2"
-zip = { version = "2", default-features = false, features = ["deflate"] }
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 js-sys = "0.3"
 
 [dependencies.web-sys]
