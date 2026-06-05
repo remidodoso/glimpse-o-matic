@@ -174,6 +174,32 @@ div.gallery {
     transform: translateY(-50%) rotate(90deg);
 }
 
+#stream-progress {
+    position: absolute;
+    bottom: calc(var(--btn-size) + 28px);
+    left: 50%;
+    transform: translateX(-50%);
+    width: 60%;
+    max-width: 400px;
+    height: 10px;
+    background: rgba(255, 255, 255, 0.12);
+    border: 1.5px solid rgba(255, 255, 255, 0.55);
+    border-radius: 6px;
+    box-shadow: 2px 4px 12px rgba(0, 0, 0, 0.7);
+    overflow: hidden;
+    pointer-events: none;
+    z-index: 5;
+    display: none;
+    transition: opacity 0.4s ease-out;
+}
+
+#stream-fill {
+    height: 100%;
+    width: 0%;
+    background: rgba(255, 255, 255, 0.7);
+    transition: width 0.15s ease-out;
+}
+
 #loading {
     position: absolute;
     inset: 0;

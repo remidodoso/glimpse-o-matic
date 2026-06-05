@@ -17,8 +17,9 @@ var landscape_mq = window.matchMedia('(orientation: landscape)');
 
 var thumbs = [];
 var current_index = null;
-var thumb_gen = 0;  // incremented on each load; cancels stale thumbnail fills
-var load_gen  = 0;  // incremented on each load; cancels stale extraction rAF loops
+var thumb_gen      = 0;     // incremented on each load; cancels stale thumbnail fills
+var load_gen       = 0;     // incremented on each load; cancels stale extraction rAF loops
+var stream_loading = false; // true while a zip stream is in progress
 
 // Slide drag state
 var is_dragging = false;
@@ -129,7 +130,7 @@ function download_current() {
     var blob  = new Blob([bytes], {type: 'image/jpeg'});
 
     if (!window.showSaveFilePicker) {
-        if (!window.confirm(name + '\n' + format_size(blob.size))) return;
+        if (navigator.maxTouchPoints === 0 && !window.confirm(name + '\n' + format_size(blob.size))) return;
         var url = URL.createObjectURL(blob);
         var a = document.createElement('a');
         a.href = url;
@@ -153,7 +154,21 @@ function download_current() {
     });
 }
 
-function load_zip(buf) {
+function hide_stream_progress() {
+    stream_loading = false;
+    var bar = document.getElementById('stream-progress');
+    if (!bar || bar.style.display === 'none') return;
+    bar.style.opacity = '0';
+    setTimeout(function() {
+        bar.style.display = 'none';
+        bar.style.opacity = '';
+    }, 450);
+}
+
+// load_zip(stream, content_length) — drives the WASM streaming zip parser.
+// `stream` is a ReadableStream (fetch response.body or File.stream()).
+// `content_length` is the total byte count (for progress %; pass 0 if unknown).
+function load_zip(stream, content_length) {
     if (animation_id     !== null) { cancelAnimationFrame(animation_id);    animation_id     = null; }
     if (hover_anim_id    !== null) { cancelAnimationFrame(hover_anim_id);   hover_anim_id    = null; }
     if (hover_idle_timer !== null) { clearTimeout(hover_idle_timer);        hover_idle_timer = null; }
@@ -172,41 +187,88 @@ function load_zip(buf) {
     header.innerHTML = '';
     thumbs = [];
 
-    // Reset progress bar, hide any previous error.
-    var fill   = document.getElementById('progress-fill');
-    var track  = document.getElementById('progress-track');
+    var bar    = document.getElementById('stream-progress');
+    var fill   = document.getElementById('stream-fill');
     var errDiv = document.getElementById('progress-error');
-    if (fill)   fill.style.width   = '0%';
-    if (track)  track.style.display = '';
+    stream_loading = true;
+    if (bar)    { bar.style.opacity = ''; bar.style.display = 'block'; }
+    if (fill)   fill.style.width = '0%';
     if (errDiv) errDiv.style.display = 'none';
 
-    var gen   = ++load_gen;
-    var total = renderer.begin_zip_load(new Uint8Array(buf));
-    glimr_log('load_zip', 'begin_zip_load (' + buf.byteLength + ' bytes)');
+    renderer.begin_zip_stream();
+    var gen       = ++load_gen;
+    ++thumb_gen;
 
-    function step() {
-        if (gen !== load_gen) return;
-        try {
-            var done = renderer.load_next_entry();
-            if (fill && total > 0)
-                fill.style.width = Math.round(renderer.load_bytes_done() / total * 100) + '%';
-            if (done) {
-                renderer.finish_zip_load();
-                glimr_log('load_zip', 'finish_zip_load done');
-                create_thumbnails();
-                if (loading) loading.style.display = 'none';
-                navigate_to(0);
-                glimr_log('load_zip', 'done');
-            } else {
-                requestAnimationFrame(step);
+    var reader      = stream.getReader();
+    var known_count = 0;
+    var bytes_recv  = 0;
+    var first_shown = false;
+
+    function pump() {
+        reader.read().then(function(result) {
+            if (gen !== load_gen) { reader.cancel(); return; }
+
+            if (!result.done) {
+                bytes_recv += result.value.length;
+                if (fill && content_length > 0)
+                    fill.style.width = Math.round(bytes_recv / content_length * 100) + '%';
+
+                try {
+                    var new_count = renderer.feed_bytes(result.value);
+
+                    for (var i = known_count; i < new_count; i++) {
+                        add_thumbnail(i);
+                    }
+
+                    // Show image 0 as soon as its entry arrives.
+                    if (!first_shown && new_count > 0) {
+                        first_shown = true;
+                        set_current_index(0);
+                        decode_image(0, function() {
+                            if (gen !== load_gen) return;
+                            draw(0);
+                            if (loading) loading.style.display = 'none';
+                            if (renderer.image_count() > 1) decode_image(1, null);
+                        });
+                    }
+
+                    // Prefetch newly arrived neighbours of the current image.
+                    if (current_index !== null) {
+                        for (var j = known_count; j < new_count; j++) {
+                            if (j === current_index - 1 || j === current_index + 1) {
+                                decode_image(j, null);
+                            }
+                        }
+                    }
+
+                    known_count = new_count;
+                } catch(e) {
+                    glimr_log('load_zip', 'error: ' + e);
+                    hide_stream_progress();
+                    if (errDiv) { errDiv.textContent = String(e); errDiv.style.display = ''; }
+                    return;
+                }
             }
-        } catch (e) {
-            glimr_log('load_zip', 'error: ' + e);
-            if (track)  track.style.display  = 'none';
-            if (errDiv) { errDiv.textContent = String(e); errDiv.style.display = ''; }
-        }
+
+            if (result.done || renderer.is_stream_done()) {
+                glimr_log('load_zip', 'stream done, ' + known_count + ' images');
+                hide_stream_progress();
+                if (known_count === 0 && errDiv) {
+                    errDiv.textContent = 'No images found in archive.';
+                    errDiv.style.display = '';
+                }
+                return;
+            }
+
+            pump();
+        }).catch(function(e) {
+            if (gen !== load_gen) return;
+            glimr_log('load_zip', 'fetch error: ' + e);
+            hide_stream_progress();
+            if (errDiv) { errDiv.textContent = 'Error: ' + String(e); errDiv.style.display = ''; }
+        });
     }
-    requestAnimationFrame(step);
+    pump();
 }
 
 // ---------------------------------------------------------------------------
@@ -229,13 +291,6 @@ function create_loading_screen() {
         div.appendChild(line);
     });
 
-    var track = document.createElement('div');
-    track.id = 'progress-track';
-    var fill = document.createElement('div');
-    fill.id = 'progress-fill';
-    track.appendChild(fill);
-    div.appendChild(track);
-
     var errDiv = document.createElement('div');
     errDiv.id = 'progress-error';
     div.appendChild(errDiv);
@@ -245,47 +300,53 @@ function create_loading_screen() {
 // Carousel / thumbnails
 // ---------------------------------------------------------------------------
 
-function create_thumbnails() {
+// Creates a single carousel thumbnail for image i and appends it to the header.
+// Safe to call incrementally as images arrive from the stream.
+function add_thumbnail(i) {
     var carousel_size = Math.min(
         (landscape_mq.matches ? window.innerWidth : window.innerHeight) * 0.18,
         G_CAROUSEL_SIZE_MAX
     );
     var header_container = document.getElementById('header_container');
+    var gen = thumb_gen;
+    let canvas = document.createElement('canvas');
+    canvas.width  = 0;
+    canvas.height = 0;
+    let divbox = document.createElement('div');
+    divbox.appendChild(canvas);
+    header_container.appendChild(divbox);
+    thumbs.push(canvas);
+    canvas.style.boxShadow = '5px 5px 4px #888';
+    canvas.style.border = '1px solid #bbb';
+    canvas.style.borderRadius = '8px';
+    canvas.style.margin = '4px';
+    canvas.addEventListener('click', function() {
+        if (carousel_drag_moved) { carousel_drag_moved = false; return; }
+        navigate_to(i);
+    });
+    var bytes = renderer.get_image_bytes(i);
+    createImageBitmap(new Blob([bytes])).then(function(bitmap) {
+        if (gen !== thumb_gen) { bitmap.close(); return; }
+        var vert = landscape_mq.matches;
+        var scale = vert ? carousel_size / bitmap.width : carousel_size / bitmap.height;
+        var tw = Math.round(bitmap.width  * scale);
+        var th = Math.round(bitmap.height * scale);
+        canvas.width  = tw;
+        canvas.height = th;
+        canvas.getContext('2d').drawImage(bitmap, 0, 0, tw, th);
+        bitmap.close();
+        if (i === current_index) scroll_carousel_to(i);
+    }).catch(function(e) {
+        glimr_log('add_thumbnail', 'thumb ' + i + ' error: ' + e);
+    });
+}
+
+// Rebuilds all thumbnails for the currently loaded gallery (used by resize handler).
+function create_thumbnails() {
+    thumb_gen++;
     var count = renderer.image_count();
-    var gen = ++thumb_gen;
-
-    for (let i = 0; i < count; i++) {
-        let canvas = document.createElement('canvas');
-        canvas.width  = 0;
-        canvas.height = 0;
-        let divbox = document.createElement('div');
-        divbox.appendChild(canvas);
-        header_container.appendChild(divbox);
-        thumbs.push(canvas);
-        canvas.style.boxShadow = '5px 5px 4px #888';
-        canvas.style.border = '1px solid #bbb';
-        canvas.style.borderRadius = '8px';
-        canvas.style.margin = '4px';
-        canvas.addEventListener('click', function() {
-            if (carousel_drag_moved) { carousel_drag_moved = false; return; }
-            navigate_to(i);
-        });
-
-        // Fire all thumbnail decodes concurrently — browser resolves as ready.
-        var bytes = renderer.get_image_bytes(i);
-        createImageBitmap(new Blob([bytes])).then(function(bitmap) {
-            if (gen !== thumb_gen) { bitmap.close(); return; }
-            var vert = landscape_mq.matches;
-            var scale = vert ? carousel_size / bitmap.width : carousel_size / bitmap.height;
-            var tw = Math.round(bitmap.width  * scale);
-            var th = Math.round(bitmap.height * scale);
-            canvas.width  = tw;
-            canvas.height = th;
-            canvas.getContext('2d').drawImage(bitmap, 0, 0, tw, th);
-            bitmap.close();
-        }).catch(function(e) {
-            glimr_log('create_thumbnails', 'thumb ' + i + ' error: ' + e);
-        });
+    for (var i = 0; i < count; i++) {
+        add_thumbnail(i);
     }
 }
 
@@ -313,6 +374,7 @@ function scroll_carousel_to(index) {
 
 function set_current_index(new_index) {
     zoom_mode = false;
+    if (stream_loading) { var _bar = document.getElementById('stream-progress'); if (_bar) _bar.style.display = 'block'; }
     if (new_index === current_index) return;
     if (current_index !== null) {
         var old = thumbs[current_index];
@@ -475,6 +537,7 @@ function enter_zoom(tap_x, tap_y) {
     clamp_pan();
 
     zoom_mode = true;
+    if (stream_loading) { var _bar = document.getElementById('stream-progress'); if (_bar) _bar.style.display = 'none'; }
     draw(0);
 }
 
@@ -483,6 +546,7 @@ function exit_zoom() {
     zoom_scale = 1.0;
     zoom_pan_x = 0;
     zoom_pan_y = 0;
+    if (stream_loading) { var _bar = document.getElementById('stream-progress'); if (_bar) _bar.style.display = 'block'; }
     draw(0);
 }
 
@@ -498,6 +562,7 @@ function enter_zoom_at_fit() {
     zoom_pan_x = 0;
     zoom_pan_y = 0;
     zoom_mode  = true;
+    if (stream_loading) { var _bar = document.getElementById('stream-progress'); if (_bar) _bar.style.display = 'none'; }
 }
 
 function apply_zoom(factor, pivot_x, pivot_y) {
@@ -879,7 +944,8 @@ function init() {
         input.addEventListener('change', function() {
             document.body.removeChild(input);
             if (!input.files || !input.files[0]) return;
-            input.files[0].arrayBuffer().then(function(buf) { load_zip(buf); });
+            var file = input.files[0];
+            load_zip(file.stream(), file.size);
         });
         input.click();
     });
@@ -904,7 +970,8 @@ function init() {
     });
 
     create_loading_screen();
-    fetch('Demo.zip')
-        .then(function(r) { return r.arrayBuffer(); })
-        .then(function(buf) { load_zip(buf); });
+    fetch('Demo.zip').then(function(r) {
+        var len = parseInt(r.headers.get('Content-Length'), 10) || 0;
+        load_zip(r.body, len);
+    });
 }

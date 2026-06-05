@@ -12,22 +12,13 @@ export class GlimrRenderer {
         wasm.__wbg_glimrrenderer_free(ptr, 0);
     }
     /**
-     * Stores the zip bytes and resets parse state. Returns total byte count
-     * so JS can compute progress as load_bytes_done() / total.
-     * @param {Uint8Array} zip_bytes
-     * @returns {number}
+     * Resets all image state and parser state. Call before feeding the first chunk.
      */
-    begin_zip_load(zip_bytes) {
-        const ptr0 = passArray8ToWasm0(zip_bytes, wasm.__wbindgen_malloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.glimrrenderer_begin_zip_load(this.__wbg_ptr, ptr0, len0);
-        return ret >>> 0;
+    begin_zip_stream() {
+        wasm.glimrrenderer_begin_zip_stream(this.__wbg_ptr);
     }
     /**
      * Draw image at `index` onto the photo canvas.
-     * `offset` is the slide drag offset in CSS pixels:
-     *   > 0 → dragging right (prev image enters from left)
-     *   < 0 → dragging left  (next image enters from right)
      * @param {number} index
      * @param {number} offset
      */
@@ -38,10 +29,7 @@ export class GlimrRenderer {
         }
     }
     /**
-     * Draws the `<` / `>` hover arrow directly onto `self.canvas` (on top of the blitted image).
-     * `zone`    — "left", "right", or "" (no-op).
-     * `opacity` — current animation opacity (0.0–1.0); no-op if ≤ 0.
-     * `index`   — current image index; used to show `>>` / `<<` at gallery boundaries.
+     * Draws the hover arrow directly onto `self.canvas`.
      * @param {number} index
      * @param {string} zone
      * @param {number} opacity
@@ -56,8 +44,6 @@ export class GlimrRenderer {
     }
     /**
      * Renders image `index` in zoom/pan mode.
-     * `scale`  — zoom factor (1.0 = 1:1 pixels, fit_scale = fully zoomed out)
-     * `pan_x/y` — top-left corner of the viewport window in image-space pixels
      * @param {number} index
      * @param {number} scale
      * @param {number} pan_x
@@ -70,19 +56,23 @@ export class GlimrRenderer {
         }
     }
     /**
-     * Sorts accumulated entries, populates names/image_bytes, frees the
-     * buffered zip bytes. Call once load_next_entry returns Ok(true).
+     * Feed the next chunk of zip bytes. Advances the state machine as far as
+     * possible, decompressing and XOR-decoding each complete entry. Returns
+     * the total number of image entries ready so far. Errors on malformed zip.
+     * @param {Uint8Array} chunk
+     * @returns {number}
      */
-    finish_zip_load() {
-        const ret = wasm.glimrrenderer_finish_zip_load(this.__wbg_ptr);
-        if (ret[1]) {
-            throw takeFromExternrefTable0(ret[0]);
+    feed_bytes(chunk) {
+        const ptr0 = passArray8ToWasm0(chunk, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.glimrrenderer_feed_bytes(this.__wbg_ptr, ptr0, len0);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
         }
+        return ret[0] >>> 0;
     }
     /**
      * Returns the raw (XOR-decoded) bytes for image i as a Uint8Array.
-     * JS passes these to createImageBitmap; the Blob is transient and never
-     * stored as an accessible object.
      * @param {number} i
      * @returns {Uint8Array}
      */
@@ -98,7 +88,6 @@ export class GlimrRenderer {
         return ret >>> 0;
     }
     /**
-     * Size of the stored (XOR-decoded) JPEG/PNG bytes for image i.
      * @param {number} i
      * @returns {number}
      */
@@ -107,7 +96,6 @@ export class GlimrRenderer {
         return ret >>> 0;
     }
     /**
-     * Decoded pixel height; 0 if image i has not been drawn yet.
      * @param {number} i
      * @returns {number}
      */
@@ -132,7 +120,6 @@ export class GlimrRenderer {
         }
     }
     /**
-     * Decoded pixel width; 0 if image i has not been drawn yet.
      * @param {number} i
      * @returns {number}
      */
@@ -150,37 +137,12 @@ export class GlimrRenderer {
         return ret !== 0;
     }
     /**
-     * Current byte position in the pending zip; divide by begin_zip_load's
-     * return value to get extraction progress (0.0–1.0).
-     * @returns {number}
-     */
-    load_bytes_done() {
-        const ret = wasm.glimrrenderer_load_bytes_done(this.__wbg_ptr);
-        return ret >>> 0;
-    }
-    /**
-     * Parses one local file header. Returns Ok(false) while entries remain,
-     * Ok(true) when the central directory is reached or the buffer is exhausted,
-     * Err if the zip is malformed or unsupported.
+     * True once a central directory or end-of-archive signature has been seen.
      * @returns {boolean}
      */
-    load_next_entry() {
-        const ret = wasm.glimrrenderer_load_next_entry(this.__wbg_ptr);
-        if (ret[2]) {
-            throw takeFromExternrefTable0(ret[1]);
-        }
-        return ret[0] !== 0;
-    }
-    /**
-     * @param {Uint8Array} zip_bytes
-     */
-    load_zip(zip_bytes) {
-        const ptr0 = passArray8ToWasm0(zip_bytes, wasm.__wbindgen_malloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.glimrrenderer_load_zip(this.__wbg_ptr, ptr0, len0);
-        if (ret[1]) {
-            throw takeFromExternrefTable0(ret[0]);
-        }
+    is_stream_done() {
+        const ret = wasm.glimrrenderer_is_stream_done(this.__wbg_ptr);
+        return ret !== 0;
     }
     /**
      * @param {HTMLCanvasElement} canvas
@@ -197,7 +159,6 @@ export class GlimrRenderer {
     }
     /**
      * Returns the XOR-decoded JPEG/PNG bytes for image i.
-     * JS uses this for the download button (one-shot blob URL, revoked immediately after click).
      * @param {number} i
      * @returns {Uint8Array}
      */
@@ -209,8 +170,7 @@ export class GlimrRenderer {
     }
     /**
      * Stores watermarked RGBA pixels for image i. Called by JS after
-     * createImageBitmap → OffscreenCanvas → getImageData. Watermark
-     * is applied here before caching.
+     * createImageBitmap → OffscreenCanvas → getImageData.
      * @param {number} i
      * @param {number} width
      * @param {number} height
@@ -241,6 +201,7 @@ export function glimr_log(func, msg) {
 }
 
 /**
+ * Exported for direct use where needed.
  * @param {Uint8Array} input
  * @returns {Uint8Array}
  */
