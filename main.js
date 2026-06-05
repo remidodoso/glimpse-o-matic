@@ -1,4 +1,6 @@
-var info_visible = false;
+var info_visible  = false;
+var about_visible = false;
+var about_html_cache = null;
 
 // ---------------------------------------------------------------------------
 // Logging — [HH:MM:SS.SSS] <func> msg  (mirrors the Rust glog format)
@@ -104,6 +106,35 @@ function hide_info() {
     info_visible = false;
 }
 
+function show_about() {
+    var content = document.getElementById('about-content');
+    if (about_html_cache !== null) {
+        content.innerHTML = about_html_cache;
+        document.getElementById('about-overlay').style.display = 'flex';
+        about_visible = true;
+        return;
+    }
+    fetch('about.html').then(function(r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.text();
+    }).then(function(html) {
+        about_html_cache = html;
+        content.innerHTML = html;
+        document.getElementById('about-overlay').style.display = 'flex';
+        about_visible = true;
+    }).catch(function() {
+        about_html_cache = '<p style="color:#555;font-size:1.1em;">No about information available.</p>';
+        content.innerHTML = about_html_cache;
+        document.getElementById('about-overlay').style.display = 'flex';
+        about_visible = true;
+    });
+}
+
+function hide_about() {
+    document.getElementById('about-overlay').style.display = 'none';
+    about_visible = false;
+}
+
 function flash_button(btn, entering) {
     var cls = entering ? 'tapped-active' : 'tapped';
     btn.classList.remove('tapped', 'tapped-active');
@@ -176,7 +207,8 @@ function load_zip(stream, content_length) {
     var loading = document.getElementById('loading');
     if (loading) loading.style.display = '';
 
-    if (info_visible) hide_info();
+    if (info_visible)  hide_info();
+    if (about_visible) hide_about();
     zoom_mode     = false;
     zoom_scale    = 1.0;
     zoom_pan_x    = 0;
@@ -721,6 +753,7 @@ function wheel(event) {
 }
 
 function keydown(event) {
+    if (about_visible) { hide_about(); return; }
     if (info_visible) {
         if (event.key === 'i' || event.key === 'I') hide_info();
         return;
@@ -933,6 +966,15 @@ function init() {
         if (e.target === this) hide_info();
     });
     document.getElementById('info-close').addEventListener('click', hide_info);
+
+    document.getElementById('btn-about').addEventListener('click', function() {
+        flash_button(this);
+        if (about_visible) hide_about(); else show_about();
+    });
+    document.getElementById('about-overlay').addEventListener('click', function(e) {
+        if (e.target === this) hide_about();
+    });
+    document.getElementById('about-close').addEventListener('click', hide_about);
 
     document.getElementById('btn-load').addEventListener('click', function() {
         flash_button(this);

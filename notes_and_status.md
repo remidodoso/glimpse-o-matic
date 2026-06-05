@@ -123,7 +123,8 @@ Active (permission requested): geolocation
 
 ### Floating Action Buttons
 
-Bottom-right corner, `position: fixed`, horizontal row: `[🖼] [⛶] [⬇] [i]`
+Bottom-right corner, `position: fixed`, horizontal row: `[🖼] [⛶] [⬇] [i]`  
+Bottom-left corner, `position: fixed`: `[α]`
 
 **Sizing**: `min(max(100vw, 100vh) / 20, 48px)` — responsive, capped at 48px on desktop  
 **Style**: white outline, white icon, transparent background, `border-radius: 12px`, drop shadow, 33% opacity by default  
@@ -136,10 +137,15 @@ Bottom-right corner, `position: fixed`, horizontal row: `[🖼] [⛶] [⬇] [i]`
   - Desktop Firefox: `window.confirm(name + size)` then silent download
   - Mobile/touch (`navigator.maxTouchPoints > 0`): direct download — browser's native download UI serves as confirmation; no extra dialog
 - **i Info** (`btn-info`): shows info overlay with filename, dimensions, file size
+- **α About** (`btn-about`): bottom-left; shows about overlay loaded from `about.html`
 
 ### Info Overlay
 
 Modal overlay (`#info-overlay`) with filename, pixel dimensions, file size. Closes on backdrop click, × button, or pressing `i`.
+
+### About Overlay
+
+Modal overlay (`#about-overlay`) with the same rounded-corner, burlywood/bisque styling as the info box. Content loaded lazily from `about.html` via `fetch()` on first open; result cached for subsequent opens. Body has `max-height: 70vh; overflow-y: auto` for long content. If `about.html` is absent or fails to load, shows a neutral fallback message. Closes on backdrop click, × button, or any keypress. New zip load also closes it.
 
 ### Keyboard Shortcuts
 
@@ -148,6 +154,7 @@ Modal overlay (`#info-overlay`) with filename, pixel dimensions, file size. Clos
 - `0`: exit zoom
 - `f` / `F`: toggle fullscreen
 - `i` / `I`: toggle info overlay
+- Any key: close about overlay (if open)
 - `Ctrl+=` / `Ctrl+−`: zoom in/out
 
 ### Logo Watermarks
@@ -201,6 +208,9 @@ JS handles only: load WASM module, file picker, `fetch`, `requestFullscreen`. Ev
 - **Download dialog mobile fix**: `navigator.maxTouchPoints > 0` skips `window.confirm()` on touch devices — Android/iOS show their own native download UI; desktop Firefox keeps the confirm dialog.
 - **Deployed to Cloudflare R2** with custom domain. Same-origin serving — `Content-Length` visible, progress bar percentage works, no CORS config needed.
 - **deployg R2 upload**: `deployg -b <bucket> -p <prefix>` uploads viewer files + archive directly to R2 via SigV4-signed S3 API. List/delete/upload all working. Cache purge code present but disabled pending Cloudflare API token permission setup.
+- **deployg `--dryrun`**: simulates full operation (reads files, computes hashes, runs S3 list) without writing, uploading, or deleting anything. Confirmation prompt shown with auto-`y (dryrun)`.
+- **deployg `-o` required**: removed default `./deploy` fallback; destination must now be specified explicitly via `-o` or `-b`.
+- **About overlay**: α button (bottom-left, serif bold) fetches `about.html` lazily and displays it in an info-style modal with scrolling body. `deployg` includes `about.html` in deploys when present.
 
 ---
 
@@ -351,15 +361,15 @@ Don't add now — breaks cross-origin resources without `Cross-Origin-Resource-P
 
 ## deployg — Deploy Tool
 
-### Local output mode (original)
+### Local output mode
 ```
-deployg [-a archive.zip] [-o output-dir] [-f]
+deployg -o <output-dir> [-a archive.zip] [-f] [--dryrun]
 ```
-Copies viewer files + archive into a local directory. `-f` clears and overwrites.
+Copies viewer files + archive into a local directory. `-f` clears and overwrites. `-o` is required; there is no default output directory.
 
-### R2 upload mode (new)
+### R2 upload mode
 ```
-deployg -b <bucket> -p <prefix> [-a archive.zip] [-f] [-y]
+deployg -b <bucket> -p <prefix> [-a archive.zip] [-f] [-y] [--dryrun]
 ```
 Uploads directly to Cloudflare R2 via S3-compatible API.
 
@@ -368,8 +378,9 @@ Uploads directly to Cloudflare R2 via S3-compatible API.
 - `-p`/`--prefix` — key prefix, e.g. `2020/Phoenix` → files land at `https://domain/2020/Phoenix/...`
 - `-f`/`--force` — if prefix is occupied: list files, confirm, delete, then upload
 - `-y`/`--yes` — skip confirmation prompt (safe for scripting)
+- `--dryrun` — simulate without modifying anything; reads files and computes hashes for accurate size output; prints `(dryrun)` on each affected line; still runs S3 list (read-only)
 - `-a`/`--archive` — source archive (default: `Demo.zip` in viewer root)
-- `-o`/`--output` — local directory output (mutually exclusive with `-b`)
+- `-o`/`--output` — local directory output (mutually exclusive with `-b`; required)
 - `-?`/`--help` — usage
 
 **Credentials file**: `%USERPROFILE%\.r2\credentials.txt` — INI format, one stanza per bucket:
@@ -383,11 +394,13 @@ domain            = https://si-p.jayenh.com
 zone_id           = ...   ; Cloudflare zone ID for cache purge
 ```
 
+**Files deployed** (both modes): `index.html`, `main.js`, `main.css`, `sip.png`, `pkg/glimr.js`, `pkg/glimr_bg.wasm`, archive (`Demo.zip`), and `about.html` if present in viewer root (optional — silently omitted if absent).
+
 **Upload flow:**
 1. List objects under `{bucket}/{prefix}/` (S3 ListObjectsV2)
 2. If occupied and no `-f` → error, no action taken
-3. If occupied and `-f` → print deletion list, confirm (unless `-y`), delete (S3 DeleteObjects)
-4. Upload viewer files then archive, each with interactive size + "done" display
+3. If occupied and `-f` → print deletion list, confirm (unless `-y` or `--dryrun`), delete (S3 DeleteObjects)
+4. Upload viewer files then archive (+ `about.html` if present), each with interactive size + "done" display
 5. _(Cloudflare cache purge — code present in `cloudflare.rs`, temporarily commented out pending API token permission verification — token needs Zone:Cache Purge scope)_
 
 **Source modules** (`tools/deployg/src/`):

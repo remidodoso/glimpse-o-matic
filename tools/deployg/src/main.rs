@@ -92,6 +92,9 @@ fn parse_args() -> Result<Args, String> {
     }
 
     // Cross-argument validation
+    if output.is_none() && bucket.is_none() {
+        return Err("no destination specified; use -o <dir> for local or -b <bucket> -p <prefix> for R2".to_string());
+    }
     if output.is_some() && bucket.is_some() {
         return Err("-o/--output and -b/--bucket are mutually exclusive".to_string());
     }
@@ -323,6 +326,14 @@ fn main() {
             format!("{}/Demo.zip", prefix_clean),
             "Demo.zip".to_string(),
         ));
+        let about_src = viewer_root.join("about.html");
+        if about_src.exists() {
+            uploads.push((
+                about_src,
+                format!("{}/about.html", prefix_clean),
+                "about.html".to_string(),
+            ));
+        }
 
         println!("Uploading to {}/{}/:", bucket, prefix_clean);
         for (local, key, label) in &uploads {
@@ -362,10 +373,9 @@ fn main() {
 
     // --- Local directory output path ---
 
-    let output_dir: PathBuf = match &args.output {
-        Some(p) => PathBuf::from(p),
-        None    => std::env::current_dir().unwrap().join("deploy"),
-    };
+    let output_dir: PathBuf = PathBuf::from(args.output.as_deref().unwrap());
+    let about_src = viewer_root.join("about.html");
+    let has_about = about_src.exists();
 
     if !args.dryrun {
         if output_dir.exists() && !is_dir_empty(&output_dir) {
@@ -392,6 +402,9 @@ fn main() {
             copy_file(&viewer_root.join(f), &output_dir.join(f));
         }
         copy_file(&archive_src, &output_dir.join("Demo.zip"));
+        if has_about {
+            copy_file(&about_src, &output_dir.join("about.html"));
+        }
     }
 
     let archive_name = archive_src.file_name()
@@ -412,4 +425,7 @@ fn main() {
         println!("  {}", f);
     }
     println!("  {}", archive_label);
+    if has_about {
+        println!("  about.html");
+    }
 }
