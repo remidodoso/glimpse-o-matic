@@ -7,6 +7,7 @@ export const glimrrenderer_begin_zip_stream: (a: number) => void;
 export const glimrrenderer_draw: (a: number, b: number, c: number) => [number, number];
 export const glimrrenderer_draw_hover_indicator: (a: number, b: number, c: number, d: number, e: number) => [number, number];
 export const glimrrenderer_draw_zoomed: (a: number, b: number, c: number, d: number, e: number) => [number, number];
+export const glimrrenderer_enforce_cache_budget: (a: number, b: number) => void;
 export const glimrrenderer_feed_bytes: (a: number, b: number, c: number) => [number, number, number];
 export const glimrrenderer_get_image_bytes: (a: number, b: number) => any;
 export const glimrrenderer_image_count: (a: number) => number;

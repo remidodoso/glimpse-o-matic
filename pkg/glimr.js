@@ -56,6 +56,17 @@ export class GlimrRenderer {
         }
     }
     /**
+     * Cap the watermarked-RGBA cache at PIXEL_CACHE_BUDGET bytes so a large
+     * catalog can't grow `pixel_cache` without bound.  Evicts the cached image
+     * farthest (by index) from `current` first, never evicting `current` itself.
+     * Evicted images are simply re-decoded + re-watermarked if revisited.
+     * JS calls this after each `receive_pixels`, anchored on the displayed image.
+     * @param {number} current
+     */
+    enforce_cache_budget(current) {
+        wasm.glimrrenderer_enforce_cache_budget(this.__wbg_ptr, current);
+    }
+    /**
      * Feed the next chunk of zip bytes. Advances the state machine as far as
      * possible, decompressing and XOR-decoding each complete entry. Returns
      * the total number of image entries ready so far. Errors on malformed zip.

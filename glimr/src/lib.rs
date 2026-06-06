@@ -9,6 +9,10 @@ pub mod watermark;
 
 const XOR_KEY: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
 
+/// Max bytes of watermarked RGBA held in `pixel_cache` before eviction kicks in.
+/// ~10 images at 6 MP (24 MB each), more at lower resolutions.
+const PIXEL_CACHE_BUDGET: usize = 250 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Console logging — [HH:MM:SS.SSS] <func> msg
 // ---------------------------------------------------------------------------
@@ -325,6 +329,28 @@ impl GlimrRenderer {
     /// Returns true if image i has been decoded and cached.
     pub fn is_decoded(&self, i: usize) -> bool {
         self.pixel_cache.contains_key(&i)
+    }
+
+    /// Cap the watermarked-RGBA cache at PIXEL_CACHE_BUDGET bytes so a large
+    /// catalog can't grow `pixel_cache` without bound.  Evicts the cached image
+    /// farthest (by index) from `current` first, never evicting `current` itself.
+    /// Evicted images are simply re-decoded + re-watermarked if revisited.
+    /// JS calls this after each `receive_pixels`, anchored on the displayed image.
+    pub fn enforce_cache_budget(&mut self, current: usize) {
+        let mut total: usize = self.pixel_cache.values().map(|(_, _, px)| px.len()).sum();
+        while total > PIXEL_CACHE_BUDGET && self.pixel_cache.len() > 1 {
+            let victim = self.pixel_cache.keys().copied()
+                .filter(|&i| i != current)
+                .max_by_key(|&i| if i >= current { i - current } else { current - i });
+            match victim {
+                Some(v) => {
+                    if let Some((_, _, px)) = self.pixel_cache.remove(&v) {
+                        total -= px.len();
+                    }
+                }
+                None => break, // only `current` remains
+            }
+        }
     }
 
     /// Draw image at `index` onto the photo canvas.

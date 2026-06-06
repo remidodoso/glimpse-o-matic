@@ -524,6 +524,10 @@ function decode_image(index, callback) {
         var pixels = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
         renderer.receive_pixels(index, bitmap.width, bitmap.height, pixels.data, build_payload());
         bitmap.close();
+        // Cap the watermarked-RGBA cache, anchored on the displayed image so the
+        // current view and its near neighbours are kept and far images evicted.
+        var anchor = (current_index !== null) ? current_index : index;
+        renderer.enforce_cache_budget(anchor);
         if (callback) callback();
     }).catch(function(e) {
         glimr_log('decode_image', 'error ' + index + ': ' + e);

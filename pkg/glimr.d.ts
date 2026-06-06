@@ -21,6 +21,14 @@ export class GlimrRenderer {
      */
     draw_zoomed(index: number, scale: number, pan_x: number, pan_y: number): void;
     /**
+     * Cap the watermarked-RGBA cache at PIXEL_CACHE_BUDGET bytes so a large
+     * catalog can't grow `pixel_cache` without bound.  Evicts the cached image
+     * farthest (by index) from `current` first, never evicting `current` itself.
+     * Evicted images are simply re-decoded + re-watermarked if revisited.
+     * JS calls this after each `receive_pixels`, anchored on the displayed image.
+     */
+    enforce_cache_budget(current: number): void;
+    /**
      * Feed the next chunk of zip bytes. Advances the state machine as far as
      * possible, decompressing and XOR-decoding each complete entry. Returns
      * the total number of image entries ready so far. Errors on malformed zip.
@@ -79,6 +87,7 @@ export interface InitOutput {
     readonly glimrrenderer_draw: (a: number, b: number, c: number) => [number, number];
     readonly glimrrenderer_draw_hover_indicator: (a: number, b: number, c: number, d: number, e: number) => [number, number];
     readonly glimrrenderer_draw_zoomed: (a: number, b: number, c: number, d: number, e: number) => [number, number];
+    readonly glimrrenderer_enforce_cache_budget: (a: number, b: number) => void;
     readonly glimrrenderer_feed_bytes: (a: number, b: number, c: number) => [number, number, number];
     readonly glimrrenderer_get_image_bytes: (a: number, b: number) => any;
     readonly glimrrenderer_image_count: (a: number) => number;
