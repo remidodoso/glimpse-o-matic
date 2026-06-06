@@ -1,3 +1,3 @@
 [workspace]
-members = ["glimr", "tools/packg", "tools/deployg"]
+members = ["glimr", "tools/packg", "tools/deployg", "tools/watermark-decode"]
 resolver = "2"

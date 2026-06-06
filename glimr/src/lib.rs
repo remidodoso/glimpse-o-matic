@@ -5,6 +5,8 @@ use std::io::Read;
 use flate2::read::DeflateDecoder;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, ImageData};
 
+pub mod watermark;
+
 const XOR_KEY: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
 
 // ---------------------------------------------------------------------------
@@ -267,9 +269,15 @@ impl GlimrRenderer {
         self.names[i].clone()
     }
 
-    /// Returns the XOR-decoded JPEG/PNG bytes for image i.
-    pub fn raw_bytes(&self, i: usize) -> Vec<u8> {
-        self.image_bytes[i].clone()
+    /// Watermarked RGBA pixels for image `i` at native resolution (for export).
+    /// Empty if the image hasn't been decoded/watermarked yet.  This is the only
+    /// full-resolution image data exposed to JS for download — it is always
+    /// watermarked; the un-watermarked source bytes are never handed out for export.
+    pub fn watermarked_pixels(&self, i: usize) -> js_sys::Uint8Array {
+        match self.pixel_cache.get(&i) {
+            Some((_, _, px)) => js_sys::Uint8Array::from(px.as_slice()),
+            None             => js_sys::Uint8Array::new_with_length(0),
+        }
     }
 
     pub fn image_width(&self, i: usize) -> u32 {
@@ -291,10 +299,26 @@ impl GlimrRenderer {
 
     /// Stores watermarked RGBA pixels for image i. Called by JS after
     /// createImageBitmap → OffscreenCanvas → getImageData.
-    pub fn receive_pixels(&mut self, i: usize, width: u32, height: u32, data: &[u8]) -> Result<(), JsValue> {
-        // TODO: apply spread-spectrum watermark here
-        glog("receive_pixels", &format!("image {} {}×{}", i, width, height));
-        self.pixel_cache.insert(i, (width, height, data.to_vec()));
+    /// `payload` is the 16-byte watermark payload assembled by JS `build_payload()`.
+    pub fn receive_pixels(&mut self, i: usize, width: u32, height: u32, data: &[u8], payload: &[u8]) -> Result<(), JsValue> {
+        let t0 = js_sys::Date::now();
+        let w = width as usize;
+        let h = height as usize;
+
+        let y_orig = watermark::extract_y(data);
+        let mut y  = y_orig.clone();
+
+        let mut wm_payload = [0u8; 16];
+        let n = payload.len().min(16);
+        wm_payload[..n].copy_from_slice(&payload[..n]);
+        watermark::embed_y(&mut y, w, h, &wm_payload);
+
+        let mut pixels = data.to_vec();
+        watermark::write_y_delta(&mut pixels, &y_orig, &y);
+
+        let ms = js_sys::Date::now() - t0;
+        glog("receive_pixels", &format!("image {} {}×{} watermarked in {:.0}ms", i, width, height, ms));
+        self.pixel_cache.insert(i, (width, height, pixels));
         Ok(())
     }
 

@@ -45,14 +45,18 @@ export class GlimrRenderer {
     is_stream_done(): boolean;
     constructor(canvas: HTMLCanvasElement, backing: HTMLCanvasElement);
     /**
-     * Returns the XOR-decoded JPEG/PNG bytes for image i.
-     */
-    raw_bytes(i: number): Uint8Array;
-    /**
      * Stores watermarked RGBA pixels for image i. Called by JS after
      * createImageBitmap → OffscreenCanvas → getImageData.
+     * `payload` is the 16-byte watermark payload assembled by JS `build_payload()`.
      */
-    receive_pixels(i: number, width: number, height: number, data: Uint8Array): void;
+    receive_pixels(i: number, width: number, height: number, data: Uint8Array, payload: Uint8Array): void;
+    /**
+     * Watermarked RGBA pixels for image `i` at native resolution (for export).
+     * Empty if the image hasn't been decoded/watermarked yet.  This is the only
+     * full-resolution image data exposed to JS for download — it is always
+     * watermarked; the un-watermarked source bytes are never handed out for export.
+     */
+    watermarked_pixels(i: number): Uint8Array;
 }
 
 /**
@@ -85,8 +89,8 @@ export interface InitOutput {
     readonly glimrrenderer_is_decoded: (a: number, b: number) => number;
     readonly glimrrenderer_is_stream_done: (a: number) => number;
     readonly glimrrenderer_new: (a: any, b: any) => [number, number, number];
-    readonly glimrrenderer_raw_bytes: (a: number, b: number) => [number, number];
-    readonly glimrrenderer_receive_pixels: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number];
+    readonly glimrrenderer_receive_pixels: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number];
+    readonly glimrrenderer_watermarked_pixels: (a: number, b: number) => any;
     readonly xor_decode: (a: number, b: number) => [number, number];
     readonly __wbindgen_exn_store: (a: number) => void;
     readonly __externref_table_alloc: () => number;

@@ -48,6 +48,57 @@ var hover_anim_start = 0;
 var hover_idle_timer = null;
 var current_draw_offset = 0;
 
+// ---------------------------------------------------------------------------
+// Watermarking — browser fingerprint + payload assembly
+// ---------------------------------------------------------------------------
+
+function fnv32a(str) {
+    var h = 0x811c9dc5;
+    for (var i = 0; i < str.length; i++) {
+        h ^= str.charCodeAt(i);
+        h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h >>> 0;
+}
+
+// Computed once at page load — stable for all images in a session.
+var g_browser_fp = (function() {
+    try {
+        var tz = '';
+        try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch(e) {}
+        return fnv32a([
+            navigator.userAgent                                      || '',
+            screen.width + 'x' + screen.height + '@' + (screen.colorDepth || 0),
+            navigator.language                                       || '',
+            tz,
+            String(navigator.hardwareConcurrency || 0),
+            String(navigator.deviceMemory        || 0),
+        ].join('|'));
+    } catch(e) { return 0; }
+})();
+
+var g_referrer_hash = (function() {
+    try {
+        var ref = document.referrer;
+        if (!ref) return 0;
+        return fnv32a(new URL(ref).hostname) & 0xFFFF;
+    } catch(e) { return 0; }
+})();
+
+// Assembles the 16-byte watermark payload.  Called per decode_image so the
+// timestamp reflects when the image was actually decoded and cached.
+function build_payload() {
+    var buf  = new ArrayBuffer(16);
+    var view = new DataView(buf);
+    view.setUint32( 0, (Date.now() / 1000) >>> 0,  true); // Unix timestamp (u32 LE)
+    view.setUint32( 4, 0,                           true); // IPv4 — deferred
+    view.setUint32( 8, g_browser_fp,                true); // browser fingerprint (u32 LE)
+    view.setUint16(12, g_referrer_hash & 0xFFFF,    true); // referrer hash (u16 LE)
+    view.setUint8 (14, g_referrer_hash !== 0 ? 1 : 0);    // flags: bit 0 = has referrer
+    view.setUint8 (15, 1);                                 // version = 1
+    return new Uint8Array(buf);
+}
+
 // Zoom state
 var zoom_mode  = false;
 var zoom_scale = 1.0;
@@ -154,12 +205,46 @@ function toggle_fullscreen() {
     }
 }
 
+// JPEG quality for downloads (browser-native encoder). High quality; the
+// luminance watermark survives re-encoding comfortably at this level.
+var G_DOWNLOAD_JPEG_QUALITY = 0.92;
+
+// Download the *watermarked* current image as a high-quality JPEG.  The displayed
+// pixels are already watermarked and cached in WASM; we pull them at native
+// resolution, encode JPEG in-browser, and save.  The un-watermarked source bytes
+// are never exported.
 function download_current() {
     if (current_index === null) return;
-    var bytes = renderer.raw_bytes(current_index);
-    var name  = renderer.image_name(current_index).replace(/\.dat$/i, '.jpg');
-    var blob  = new Blob([bytes], {type: 'image/jpeg'});
+    var index = current_index;
+    // Ensure the watermarked pixels exist (instant if already displayed/cached).
+    decode_image(index, function() { export_watermarked_jpeg(index); });
+}
 
+// Strip any extension and force .jpg (download is always JPEG now).
+function jpeg_name(index) {
+    return renderer.image_name(index).replace(/\.[^./\\]+$/, '') + '.jpg';
+}
+
+function export_watermarked_jpeg(index) {
+    var w = renderer.image_width(index);
+    var h = renderer.image_height(index);
+    var rgba = renderer.watermarked_pixels(index);
+    if (!w || !h || rgba.length !== w * h * 4) {
+        glimr_log('download_current', 'no watermarked pixels for index ' + index);
+        return;
+    }
+    var oc  = new OffscreenCanvas(w, h);
+    var ctx = oc.getContext('2d');
+    // Zero-copy view of the WASM-returned buffer as clamped RGBA.
+    var clamped = new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, rgba.length);
+    ctx.putImageData(new ImageData(clamped, w, h), 0, 0);
+
+    oc.convertToBlob({ type: 'image/jpeg', quality: G_DOWNLOAD_JPEG_QUALITY })
+        .then(function(blob) { save_blob(blob, jpeg_name(index)); })
+        .catch(function(e) { glimr_log('download_current', 'encode error: ' + e); });
+}
+
+function save_blob(blob, name) {
     if (!window.showSaveFilePicker) {
         if (navigator.maxTouchPoints === 0 && !window.confirm(name + '\n' + format_size(blob.size))) return;
         var url = URL.createObjectURL(blob);
@@ -437,7 +522,7 @@ function decode_image(index, callback) {
         var ctx = oc.getContext('2d');
         ctx.drawImage(bitmap, 0, 0);
         var pixels = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
-        renderer.receive_pixels(index, bitmap.width, bitmap.height, pixels.data);
+        renderer.receive_pixels(index, bitmap.width, bitmap.height, pixels.data, build_payload());
         bitmap.close();
         if (callback) callback();
     }).catch(function(e) {

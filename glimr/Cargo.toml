@@ -4,12 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "lib"]
 
 [dependencies]
 wasm-bindgen = "0.2"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 js-sys = "0.3"
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 [dependencies.web-sys]
 version = "0.3"

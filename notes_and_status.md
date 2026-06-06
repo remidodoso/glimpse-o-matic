@@ -132,7 +132,10 @@ Bottom-left corner, `position: fixed`: `[α]`
 
 - **🖼 Load archive** (`btn-load`): opens file picker, loads selected zip via `File.stream()`
 - **⛶ Fullscreen** (`btn-fullscreen`): toggles fullscreen; stays at 60% opacity while active
-- **⬇ Download** (`btn-download`): downloads current image
+- **⬇ Download** (`btn-download`): downloads the **watermarked** current image as a
+  high-quality JPEG (q 0.92). Pulls the native-resolution watermarked RGBA from WASM
+  (`watermarked_pixels`), encodes JPEG in-browser via `OffscreenCanvas.convertToBlob`,
+  forces a `.jpg` name, then saves. The un-watermarked source is never exported.
   - Chrome/Edge: `showSaveFilePicker` → native OS Save As dialog
   - Desktop Firefox: `window.confirm(name + size)` then silent download
   - Mobile/touch (`navigator.maxTouchPoints > 0`): direct download — browser's native download UI serves as confirmation; no extra dialog
@@ -262,7 +265,10 @@ JS handles only: load WASM module, file picker, `fetch`, `requestFullscreen`. Ev
 - `image_name(i) -> String`
 - `image_file_size(i) -> usize`
 - `image_width(i) -> u32` / `image_height(i) -> u32` — from pixel_cache; 0 if not yet decoded
-- `raw_bytes(i) -> Vec<u8>` — XOR-decoded JPEG bytes; used for download (ephemeral blob URL)
+- `watermarked_pixels(i) -> Uint8Array` — native-resolution **watermarked** RGBA from
+  `pixel_cache` (empty if not decoded); used for download (JS encodes JPEG via
+  `OffscreenCanvas`). Replaced `raw_bytes` — there is no longer any API that hands the
+  un-watermarked source bytes to JS for export.
 - `get_image_bytes(i) -> Uint8Array` — for `createImageBitmap`; momentary JS exposure acceptable under "moderate inconvenience" model
 - `receive_pixels(i, width, height, data: &[u8]) -> Result<(), JsValue>` — stores RGBA in pixel_cache; watermark applied here (currently no-op stub)
 - `is_decoded(i) -> bool`
@@ -326,6 +332,8 @@ Display order = zip entry order (no sort). `packg` writes entries in hash-sorted
 
 - **Network tab**: `.dat` XOR encoding — no raw JPEG in transit
 - **Canvas (`#photo`)**: watermarked version only — acceptable
+- **Download**: exports the watermarked image (JPEG, in-browser encode) only. (Previously
+  served `raw_bytes` = the un-watermarked original — a one-click leak, now closed; `raw_bytes` removed.)
 - **`decode` canvas**: created programmatically, never appended to DOM — not visible in element inspector
 - **`#backing`**: has `hidden` attribute but still in DOM — minor gap; TODO: create programmatically
 - **WASM linear memory**: `pixel_cache` raw RGBA — inspectable only by knowing byte offset
@@ -444,13 +452,37 @@ zone_id           = ...   ; Cloudflare zone ID for cache purge
 - **stream_loading flag**: JS boolean set true at `load_zip` start, false in `hide_stream_progress()`. Used by zoom enter/exit and `set_current_index` to decide whether to show/hide `#stream-progress`.
 - **Carousel scroll on orientation change**: `add_thumbnail` calls `scroll_carousel_to(i)` inside the `createImageBitmap.then` callback — at that moment the canvas has its actual size and the scroll lands correctly. Calling it synchronously after `create_thumbnails()` doesn't work (0×0 canvases).
 - **Download dialog on mobile**: `navigator.maxTouchPoints > 0` detects touch devices. These get native browser download UI and don't need our `window.confirm()`. Edge case: touchscreen laptops with desktop Firefox skip the dialog (minor; acceptable).
-- **Memory**: full-resolution RGBA in `pixel_cache`, no LRU. 2–5MP images typical; fine for normal galleries. Add eviction if needed for very large galleries.
+- **Memory**: full-resolution RGBA in `pixel_cache`, **no LRU / unbounded** — every decoded image stays resident forever (~8–24MB each at 2–6MP). Latent leak even with only ±1 prefetch: over a long session the whole gallery accumulates. **Eviction is the next planned change** — see *Background Pre-Watermarking & Cache Memory*.
 - **wasm-pack build**: must use `--out-dir ../pkg` (or `build.ps1`) — root `pkg/` is what the server serves.
+
+---
+
+## Background Pre-Watermarking & Cache Memory
+
+### What exists
+- `navigate_to()` ([main.js](main.js)) decodes+watermarks the current image, then fires `decode_image(index±1)` to pre-watermark immediate neighbours. The streaming loader also prefetches arriving neighbours of the current image.
+- `decode_image()` is idempotent (`renderer.is_decoded` guard); the embed itself — `receive_pixels` → `extract_y` + `embed_y` — is a **synchronous WASM call on the main thread** (~100–500ms for a 6MP image).
+- Results live in `pixel_cache: HashMap<usize,(w,h,Vec<u8>)>` as **watermarked RGBA, unbounded** (cleared only on full reset).
+
+### Observation (this discussion)
+The ±1 pre-watermarking works well — scrolling to a neighbour is usually delay-free. But it surfaced that the cache holds **uncompressed RGBA indefinitely** (~8–24MB/image). This is a latent memory problem regardless of any new feature: a long viewing session already accumulates every visited image. The original idea was to *extend* background watermarking to **all** images; on reflection the more important first step is the opposite — **evict**, so the cache stays bounded.
+
+### Decision / priority order
+1. **Eviction first (LRU window).** Bound `pixel_cache` to the ~N images nearest `current_index`; evict the farthest on insert. Keeps scrolling snappy (the window covers realistic navigation) while capping memory. A far revisit just re-embeds (~300ms CPU) — acceptable. This is worth doing *on its own*, before any "watermark everything" work.
+2. **Background sweep to all (optional, gated on #1).** Only after the cache is bounded does a full outward sweep make sense. Schedule one image per idle slice (`requestIdleCallback`, `setTimeout` fallback), concurrency 1, nearest-first, re-seeded on navigation, driven also by stream arrival with a post-stream mop-up, abandoned on new gallery (`load_gen`). With an LRU cap in place, "all" effectively means "the window stays warm as you move," not "all retained at once."
+3. **Compact retention (only if truly needed).** To genuinely keep *every* watermarked image at sane memory, store an encoded blob (WebP/PNG-lossless) instead of raw RGBA (~10× smaller), decode-to-canvas on draw. More complexity (re-encode in the sweep, decode per draw); revisit only if galleries are large and full retention is actually wanted.
+4. **Web Worker embed (heavyweight, separate concern).** Moving `receive_pixels` to a worker with its own WASM instance removes *all* main-thread hitching during embeds. Worth it only if idle-time embeds still cause a noticeable hitch.
+
+### Notes
+- **Security: neutral.** Un-watermarked originals already sit resident as the obfuscated zip bytes (`image_bytes`); pre-watermarking more (or evicting) doesn't widen dev-tools exposure. Transient un-watermarked RGBA still only exists momentarily per embed.
+- **Open question (drives #2/#3):** typical and worst-case gallery sizes, image dimensions, and whether mobile is a target. Under ~20–30 images a generous LRU window effectively retains everything; hundreds → the window/eviction matters and full retention needs #3.
 
 ---
 
 ## TODO
 
+- **`pixel_cache` LRU eviction (priority)**: bound the watermarked-RGBA cache to an N-image window around `current_index`, evicting the farthest on insert. Fixes the current unbounded-memory leak. Prerequisite for any "background-watermark all" work. See *Background Pre-Watermarking & Cache Memory*.
+- **Background watermark sweep (after eviction)**: idle-scheduled, nearest-first, concurrency 1, re-seeded on navigation; keeps the LRU window warm ahead of scrolling.
 - **Step 8 — LSB watermark stub**: In `receive_pixels`, write `"GLIM"` magic + 28 zero payload bytes into RGBA LSBs. Structured for `read-watermark` tool.
 - **mozjpeg-sys**: If security model tightens (pixels must not pass through JS), revisit C build toolchain (NASM + CMake + clang wasm32 target) on Windows.
 - **Rayon parallelism**: `wasm-bindgen-rayon` + `coi-serviceworker`. Less critical now; revisit when `receive_pixels` applies a real watermark algorithm.

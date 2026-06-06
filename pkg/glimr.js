@@ -158,31 +158,36 @@ export class GlimrRenderer {
         return this;
     }
     /**
-     * Returns the XOR-decoded JPEG/PNG bytes for image i.
-     * @param {number} i
-     * @returns {Uint8Array}
-     */
-    raw_bytes(i) {
-        const ret = wasm.glimrrenderer_raw_bytes(this.__wbg_ptr, i);
-        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
-        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-        return v1;
-    }
-    /**
      * Stores watermarked RGBA pixels for image i. Called by JS after
      * createImageBitmap → OffscreenCanvas → getImageData.
+     * `payload` is the 16-byte watermark payload assembled by JS `build_payload()`.
      * @param {number} i
      * @param {number} width
      * @param {number} height
      * @param {Uint8Array} data
+     * @param {Uint8Array} payload
      */
-    receive_pixels(i, width, height, data) {
+    receive_pixels(i, width, height, data, payload) {
         const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
         const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.glimrrenderer_receive_pixels(this.__wbg_ptr, i, width, height, ptr0, len0);
+        const ptr1 = passArray8ToWasm0(payload, wasm.__wbindgen_malloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.glimrrenderer_receive_pixels(this.__wbg_ptr, i, width, height, ptr0, len0, ptr1, len1);
         if (ret[1]) {
             throw takeFromExternrefTable0(ret[0]);
         }
+    }
+    /**
+     * Watermarked RGBA pixels for image `i` at native resolution (for export).
+     * Empty if the image hasn't been decoded/watermarked yet.  This is the only
+     * full-resolution image data exposed to JS for download — it is always
+     * watermarked; the un-watermarked source bytes are never handed out for export.
+     * @param {number} i
+     * @returns {Uint8Array}
+     */
+    watermarked_pixels(i) {
+        const ret = wasm.glimrrenderer_watermarked_pixels(this.__wbg_ptr, i);
+        return ret;
     }
 }
 if (Symbol.dispose) GlimrRenderer.prototype[Symbol.dispose] = GlimrRenderer.prototype.free;
@@ -315,10 +320,18 @@ function __wbg_get_imports() {
             const ret = new Uint8Array(getArrayU8FromWasm0(arg0, arg1));
             return ret;
         },
+        __wbg_new_with_length_36a4998e27b014c5: function(arg0) {
+            const ret = new Uint8Array(arg0 >>> 0);
+            return ret;
+        },
         __wbg_new_with_u8_clamped_array_and_sh_e3609225f4ad3a74: function() { return handleError(function (arg0, arg1, arg2, arg3) {
             const ret = new ImageData(getClampedArrayU8FromWasm0(arg0, arg1), arg2 >>> 0, arg3 >>> 0);
             return ret;
         }, arguments); },
+        __wbg_now_190933fa139cc119: function() {
+            const ret = Date.now();
+            return ret;
+        },
         __wbg_putImageData_9118a61bc5ed588d: function() { return handleError(function (arg0, arg1, arg2, arg3) {
             arg0.putImageData(arg1, arg2, arg3);
         }, arguments); },
