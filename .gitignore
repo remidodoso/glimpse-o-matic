@@ -17,5 +17,8 @@ glimr/pkg/
 tests/sample_*.png
 tests/residual_wm.png
 
+# Characterization reports: track the .md (living docs), ignore heatmap PNGs for now
+tests/reports/*.png
+
 # Local editor workspace
 glimpse-o-matic.code-workspace

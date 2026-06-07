@@ -13,6 +13,7 @@ js-sys = "0.3"
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+rustfft = "6"   # native test-only (FFT for registration/autocorrelation experiments)
 
 [dependencies.web-sys]
 version = "0.3"

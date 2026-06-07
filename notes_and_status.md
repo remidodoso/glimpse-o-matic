@@ -217,6 +217,67 @@ JS handles only: load WASM module, file picker, `fetch`, `requestFullscreen`. Ev
 
 ---
 
+## Watermarking — Status Checkpoint (2026-06-07)
+
+Detailed design + tuning rationale live in `watermarking.md`; measured data in
+`tests/reports/`. This is the milestone-level snapshot.
+
+**Algorithm (shipped; WASM-active via `receive_pixels` → `embed_y`):**
+- Spread-spectrum in **CDF 5/3 DWT** detail bands **LH2/HL2/LH3/HL3** (Y channel), with a
+  modulo-tiled 64² PN sequence per payload bit (128-bit payload).
+- **ALPHA 0.15**, **EMBED_LEVELS [2,3]**, **perceptual masking** (`MASK_STRENGTH 0.5`,
+  mean-1 / energy-neutral). Imperceptibility much improved: PSNR ≈ 45.5 dB, smooth
+  film-grain (CDF 5/3) rather than Haar "popcorn", hidden in texture by masking.
+- Tuning journey (all measured): Haar → **CDF 5/3**; levels [3,4] → **[2,3]**; ALPHA
+  1.0 → 0.3 → **0.15**; **modulo** (not stretched/normalized) PN tiling; masking blend.
+
+**Decoding (`glimr` + `tools/watermark-decode`):**
+- The critically-sampled DWT is **shift-variant** → recovery needs the *exact* original
+  pixel grid. `decode_y_at_size` resamples the suspect back to the original dimensions →
+  matched decode → handles **arbitrary scale given the original dimensions**.
+- CLI modes: `--size WxH` / `--ref <orig>` (known dims), **`--scan [MIN:MAX]`** (brute-force
+  size; `rayon`-threaded `--threads`, Ctrl-C-safe partial results, σ-confidence + top-N),
+  and blind `decode_y` (assumes native resolution).
+- Confidence = score vs the scan's own noise floor (σ above median) + a structural
+  `version`-byte self-check.
+
+**Robustness (measured — see `tests/reports/`):**
+- JPEG q70–90: **0 errors**. Resize 50–120% (size known/scanned): **0 errors**; 33% marginal.
+- Crop (`crop_tolerance.md`): ~0 tolerance via resample today, **but the signal survives** —
+  pad-at-known-offset decodes 0 errors up to a 10% edge crop. So crop is a **registration**
+  problem (recover the offset), not signal loss.
+
+**Blind registration research (experimental — NOT shipped):**
+- **Stage 1** (`registration_stage1.md`): blind **scale** recovery from a **512×512** excerpt
+  via spectral-whitened autocorrelation — exact period (0% err), prominence 16–88; masking
+  does not hurt. (256² needs ≤0.5×.)
+- **Stage 2** (`registration_stage2.md`): blind **scale + offset + decode** proof-of-concept.
+  Scale exact (≤0.6%), crop offset recovered correctly, decode **0 errors on easy/medium
+  cells** (folding the *whole* image, ~95 tiles). Two limits, both predicted: marginal
+  per-bit SNR (phase prominence 2–12) and scale-precision drift at heavy downscale. Levers:
+  add level-3, **ECC**, scale refinement, sub-region decode. Small-sample-only decode (e.g.
+  512 alone, ~4 tiles) is **not** yet viable — fold SNR ∝ √(tile count).
+
+**Infrastructure this cycle:**
+- **Memory**: `pixel_cache` capped at **250 MB** (`enforce_cache_budget`, farthest-from-current eviction).
+- **Download**: exports the **watermarked** image as JPEG (q0.92, `watermarked_pixels`);
+  `raw_bytes` removed — closed the one-click un-watermarked-original leak.
+- **Test tiers**: fast correctness + robustness regression (assert) run always;
+  **characterization sweeps** are `#[ignore]` and write `tests/reports/*.md` (`crop_tolerance`,
+  `registration_stage1`, `registration_stage2`). `rustfft` dev-dep; `embed_y_masked(strength)`
+  exposes the masking knob for experiments.
+- **`tests/reports/`**: `.md` tracked as living docs, heatmap PNGs gitignored. `.gitignore`
+  cleaned (untracked generated PNGs / `glimr/pkg` / workspace file; force-tracked the
+  `tests/test_a.jpg` fixture that `*.jpg` was wrongly excluding).
+
+**Next:**
+- **ECC / checksum** (queued) — strengthens normal decode, registration margin, and turns the
+  confidence check into a rigorous "verified" verdict.
+- Then Stage 2 robustness (level-3 + scale refinement) → wire a blind **`--auto`** decode mode
+  that supersedes `--scan`/`--size` and adds crop tolerance.
+
+---
+
 ## Phase 2 — In-Progress Detail
 
 ### Step progress

@@ -321,7 +321,7 @@ fn box_blur_3x3(src: &[f32], w: usize, h: usize) -> Vec<f32> {
 ///
 /// Computed from the forward-DWT coefficients *before* this level is modified,
 /// so it reflects the original image content.
-fn masking_gain(coeffs: &[f32], width: usize, height: usize, level: u32) -> (Vec<f32>, usize, usize) {
+fn masking_gain(coeffs: &[f32], width: usize, height: usize, level: u32, mask_strength: f32) -> (Vec<f32>, usize, usize) {
     let mut rw = width;
     let mut rh = height;
     for _ in 1..level { rw /= 2; rh /= 2; }
@@ -352,12 +352,12 @@ fn masking_gain(coeffs: &[f32], width: usize, height: usize, level: u32) -> (Vec
         gsum += *g;
     }
     let renorm = (sh * sw) as f32 / gsum.max(1e-6);
-    // Renormalize to mean 1, then blend toward uniform (1.0) by MASK_STRENGTH.
+    // Renormalize to mean 1, then blend toward uniform (1.0) by `mask_strength`.
     // The blend stays mean-1 (energy-neutral) and tames the energy that full
     // masking piles onto edges — which otherwise reads like JPEG ringing.
     for g in gain.iter_mut() {
         let normalized = *g * renorm;
-        *g = 1.0 + MASK_STRENGTH * (normalized - 1.0);
+        *g = 1.0 + mask_strength * (normalized - 1.0);
     }
     (gain, sh, sw)
 }
@@ -481,11 +481,18 @@ fn resample_y(src: &[f32], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<f3
 /// Embed `payload` (16 bytes = 128 bits) into the Y channel in-place.
 /// `y` is a row-major f32 array of `width × height` luminance values.
 pub fn embed_y(y: &mut [f32], width: usize, height: usize, payload: &[u8; 16]) {
+    embed_y_masked(y, width, height, payload, MASK_STRENGTH);
+}
+
+/// Like `embed_y` but with an explicit perceptual-masking blend strength
+/// (0 = uniform, 1 = full). Exposed so experiments can compare masked vs uniform
+/// embedding (e.g. its effect on the watermark's self-synchronizing periodicity).
+pub fn embed_y_masked(y: &mut [f32], width: usize, height: usize, payload: &[u8; 16], mask_strength: f32) {
     dwt_2d_fwd(y, width, height, DECOMP_DEPTH);
     let bits = payload_to_bits(payload);
     for &level in EMBED_LEVELS {
         // Masking gain from this level's detail energy, before it is modified.
-        let (gain, gsh, gsw) = masking_gain(y, width, height, level);
+        let (gain, gsh, gsw) = masking_gain(y, width, height, level, mask_strength);
         for &band in &[Subband::LH, Subband::HL] {
             let (r0, r1, c0, c1) = subband_bounds(width, height, level, band);
             if r1 > r0 && c1 > c0 {
@@ -1080,5 +1087,734 @@ mod tests {
         println!("score @correct={:.1}  @wrong(+60px)={:.1}", good, bad);
         assert!(good > 3.0 * bad,
             "alignment peak not distinctive: correct={good:.1} wrong={bad:.1}");
+    }
+
+    // ── Crop tolerance characterization ───────────────────────────────────────
+    //
+    // Measures how much edge-cropping the watermark survives, via three decode
+    // strategies, and writes tests/crop_tolerance.md.  Ignored by default (slow,
+    // and it's a report generator, not a gate):
+    //   cargo test -p glimr --release crop_tolerance -- --ignored --nocapture
+    //
+    //   A — resample to original (today's `decode_y_at_size`): stretch the cropped
+    //       sub-rectangle back to the original dimensions.
+    //   B — pad at the *known* crop offset (oracle): drop the cropped pixels at
+    //       their original (x0,y0) in a full-size frame.  If this decodes, the
+    //       signal SURVIVED the crop — registration is all that's missing.
+    //   C — pad at offset 0: ignore the origin shift.  B-vs-C isolates translation.
+
+    // Home for generated characterization reports/artifacts (created on demand).
+    fn reports_dir() -> std::path::PathBuf {
+        let d = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().join("tests").join("reports");
+        std::fs::create_dir_all(&d).ok();
+        d
+    }
+
+    fn crop_errs(p: &[u8; 16]) -> usize {
+        PHASE3_PAYLOAD.iter().zip(p.iter()).map(|(a, b)| (a ^ b).count_ones() as usize).sum()
+    }
+
+    // Copy a row-major RGB sub-rectangle out of a full-frame buffer.
+    fn crop_rgb(src: &[u8], ow: usize, x0: usize, y0: usize, cw: usize, ch: usize) -> Vec<u8> {
+        let mut out = vec![0u8; cw * ch * 3];
+        for ry in 0..ch {
+            let s = ((y0 + ry) * ow + x0) * 3;
+            let d = ry * cw * 3;
+            out[d..d + cw * 3].copy_from_slice(&src[s..s + cw * 3]);
+        }
+        out
+    }
+
+    // Place a cw×ch Y patch into a fresh ow×oh frame at (x0,y0); rest = `fill`.
+    fn pad_y(patch: &[f32], cw: usize, ch: usize, ow: usize, oh: usize,
+             x0: usize, y0: usize, fill: f32) -> Vec<f32> {
+        let mut out = vec![fill; ow * oh];
+        for ry in 0..ch {
+            let s = ry * cw;
+            let d = (y0 + ry) * ow + x0;
+            out[d..d + cw].copy_from_slice(&patch[s..s + cw]);
+        }
+        out
+    }
+
+    #[test]
+    #[ignore]
+    fn crop_tolerance() {
+        let tests_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().join("tests");
+        let img = image::open(tests_dir.join("test_a.jpg")).unwrap().into_rgb8();
+        let (ow, oh) = (img.width() as usize, img.height() as usize);
+        let pixels = img.into_raw();
+
+        // Embed once; every case crops this same watermarked buffer.
+        let orig_y = extract_y_rgb(&pixels);
+        let mut wm_y = orig_y.clone();
+        embed_y(&mut wm_y, ow, oh, &PHASE3_PAYLOAD);
+        let mut pixels_wm = pixels.clone();
+        write_y_delta_rgb(&mut pixels_wm, &orig_y, &wm_y);
+
+        // (label, left, top, right, bottom) = pixels removed per edge.
+        let cases: &[(&str, usize, usize, usize, usize)] = &[
+            ("1px right",       0, 0, 1, 0),
+            ("1px bottom",      0, 0, 0, 1),
+            ("1px left",        1, 0, 0, 0),
+            ("1px top",         0, 1, 0, 0),
+            ("1px L+R",         1, 0, 1, 0),
+            ("1px T+B",         0, 1, 0, 1),
+            ("2px right",       0, 0, 2, 0),
+            ("4px right",       0, 0, 4, 0),
+            ("8px right",       0, 0, 8, 0),
+            ("16px right",      0, 0, 16, 0),
+            ("32px right",      0, 0, 32, 0),
+            ("64px right",      0, 0, 64, 0),
+            ("128px right",     0, 0, 128, 0),
+            ("8px corner T+L",  8, 8, 0, 0),
+            ("16px all",        16, 16, 16, 16),
+            ("2% all (50px)",   50, 50, 50, 50),
+            ("5% all (125px)",  125, 125, 125, 125),
+            ("10% all (250px)", 250, 250, 250, 250),
+        ];
+
+        let mut rows = String::new();
+        for &(label, l, t, r, b) in cases {
+            let (x0, y0) = (l, t);
+            let (cw, ch) = (ow - l - r, oh - t - b);
+            let cropped_rgb = crop_rgb(&pixels_wm, ow, x0, y0, cw, ch);
+            let cropped_y   = extract_y_rgb(&cropped_rgb);
+            let fill = cropped_y.iter().sum::<f32>() / cropped_y.len() as f32;
+
+            // A — resample the cropped sub-rect back to original dimensions.
+            let (pa, sa) = decode_y_at_size_verbose(&cropped_y, cw, ch, ow, oh);
+            // B — pad at the true offset, matched decode (no-op resample).
+            let yb = pad_y(&cropped_y, cw, ch, ow, oh, x0, y0, fill);
+            let (pb, sb) = decode_y_at_size_verbose(&yb, ow, oh, ow, oh);
+            // C — pad at offset 0.
+            let yc = pad_y(&cropped_y, cw, ch, ow, oh, 0, 0, fill);
+            let (pc, sc) = decode_y_at_size_verbose(&yc, ow, oh, ow, oh);
+
+            rows.push_str(&format!(
+                "| {:<15} | {:>11} | {:>9} | {:>3} / {:>3.0} | {:>3} / {:>3.0} | {:>3} / {:>3.0} |\n",
+                label,
+                format!("{},{},{},{}", l, t, r, b),
+                format!("{}×{}", cw, ch),
+                crop_errs(&pa), sa,
+                crop_errs(&pb), sb,
+                crop_errs(&pc), sc,
+            ));
+            println!("{:<15} A={:>3}/{:>3.0}  B={:>3}/{:>3.0}  C={:>3}/{:>3.0}",
+                label, crop_errs(&pa), sa, crop_errs(&pb), sb, crop_errs(&pc), sc);
+        }
+
+        let report = format!(
+"# Crop tolerance — characterization
+
+Source: `tests/test_a.jpg` ({ow}×{oh}).  Wavelet: CDF 5/3.  ALPHA={alpha}, levels {levels:?}.
+Payload: `DEADBEEF CAFEBABE 01234567 89ABCDEF` (test pattern, so `version` reads invalid — \
+expected).  Errors are out of {bits}; detection floor ≈ {floor:.0}, strong ≈ {strong:.0}, \
+off-grid noise ≈ 7.
+
+Regenerate: `cargo test -p glimr --release crop_tolerance -- --ignored --nocapture`
+
+**Strategies** (cell = `errors / score`):
+- **A — resample to original** (current `decode_y_at_size`): stretches the cropped sub-rect
+  back to {ow}×{oh}.  This is what the shipped decoder does today.
+- **B — pad at known offset** (oracle): drops the cropped pixels at their original (x0,y0)
+  in a full {ow}×{oh} frame.  If B decodes, the watermark **survived** the crop and only
+  registration (recovering the offset) is missing.
+- **C — pad at offset 0**: same padding but ignores the origin shift.  B-vs-C isolates the
+  translation: right/bottom crops don't shift the origin, left/top do.
+
+| case            | removed L,T,R,B | retained  |  A resample | B pad@offset |   C pad@0 |
+|-----------------|-----------------|-----------|-------------|--------------|-----------|
+{rows}
+_Lower errors / higher score = better. 0 errors = exact recovery._
+",
+            ow = ow, oh = oh, alpha = ALPHA, levels = EMBED_LEVELS, bits = PAYLOAD_BITS,
+            floor = detection_floor(), strong = detection_strong(), rows = rows,
+        );
+
+        let path = reports_dir().join("crop_tolerance.md");
+        std::fs::write(&path, report).unwrap();
+        println!("crop tolerance report → {}", path.display());
+    }
+
+    // ── Stage 1: registration feasibility — autocorrelation of a small excerpt ──
+    //
+    // Question: in a 512×512 excerpt, is the watermark's periodic lattice visible
+    // enough to read its period (→ scale)?  The level-2 tile period is 256 px at
+    // embed scale, so at scale s a B-px block holds B/(256·s) periods (need ≥2).
+    //
+    //   cargo test -p glimr --release registration_stage1 -- --ignored --nocapture
+    //
+    // Compares the blind case (whitened watermarked block) against an ORACLE
+    // (autocorrelation of the pure watermark delta, content removed) to separate
+    // "is the periodicity present" from "is it visible through image content".
+    // Also probes whether perceptual masking smears the lattice (mask 0 vs 0.5).
+
+    use rustfft::{FftPlanner, num_complex::Complex};
+
+    fn hann(i: usize, n: usize) -> f32 {
+        let x = std::f32::consts::PI * i as f32 / (n as f32 - 1.0);
+        x.sin() * x.sin()
+    }
+
+    fn fft_2d(buf: &mut [Complex<f32>], n: usize, planner: &mut FftPlanner<f32>, inverse: bool) {
+        let fft = if inverse { planner.plan_fft_inverse(n) } else { planner.plan_fft_forward(n) };
+        for r in 0..n { fft.process(&mut buf[r * n..r * n + n]); }
+        let mut col = vec![Complex::new(0.0, 0.0); n];
+        for c in 0..n {
+            for r in 0..n { col[r] = buf[r * n + c]; }
+            fft.process(&mut col);
+            for r in 0..n { buf[r * n + c] = col[r]; }
+        }
+    }
+
+    /// Linear 2-D autocorrelation of a b×b block: Hann-windowed, mean-removed,
+    /// zero-padded to 2b (so the result is linear, not circular), zero-lag shifted
+    /// to the centre (b,b).  Returns the (2b×2b) real autocorrelation.
+    fn autocorr_2d(block: &[f32], b: usize, planner: &mut FftPlanner<f32>) -> Vec<f32> {
+        let n = 2 * b;
+        let mean = block.iter().sum::<f32>() / (b * b) as f32;
+        let mut buf = vec![Complex::new(0.0f32, 0.0); n * n];
+        for y in 0..b {
+            let wy = hann(y, b);
+            for x in 0..b {
+                buf[y * n + x] = Complex::new((block[y * b + x] - mean) * wy * hann(x, b), 0.0);
+            }
+        }
+        fft_2d(&mut buf, n, planner, false);
+        for z in buf.iter_mut() { *z = Complex::new(z.norm_sqr(), 0.0); }
+        fft_2d(&mut buf, n, planner, true);
+        let norm = (n * n) as f32;
+        let mut out = vec![0.0f32; n * n];
+        for y in 0..n {
+            for x in 0..n {
+                out[((y + b) % n) * n + (x + b) % n] = buf[y * n + x].re / norm;
+            }
+        }
+        out
+    }
+
+    fn extract_block(src: &[f32], w: usize, x0: usize, y0: usize, b: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; b * b];
+        for ry in 0..b {
+            let s = (y0 + ry) * w + x0;
+            out[ry * b..ry * b + b].copy_from_slice(&src[s..s + b]);
+        }
+        out
+    }
+
+    // Separable box blur (edge-clamped); used for a high-pass content suppressor.
+    fn box_blur(src: &[f32], b: usize, radius: usize) -> Vec<f32> {
+        let k = (2 * radius + 1) as f32;
+        let mut tmp = vec![0.0f32; b * b];
+        for y in 0..b {
+            for x in 0..b {
+                let mut s = 0.0;
+                for d in 0..=2 * radius {
+                    let xx = (x as isize + d as isize - radius as isize).clamp(0, b as isize - 1) as usize;
+                    s += src[y * b + xx];
+                }
+                tmp[y * b + x] = s / k;
+            }
+        }
+        let mut out = vec![0.0f32; b * b];
+        for x in 0..b {
+            for y in 0..b {
+                let mut s = 0.0;
+                for d in 0..=2 * radius {
+                    let yy = (y as isize + d as isize - radius as isize).clamp(0, b as isize - 1) as usize;
+                    s += tmp[yy * b + x];
+                }
+                out[y * b + x] = s / k;
+            }
+        }
+        out
+    }
+
+    fn highpass(block: &[f32], b: usize, radius: usize) -> Vec<f32> {
+        let lp = box_blur(block, b, radius);
+        block.iter().zip(lp.iter()).map(|(a, l)| a - l).collect()
+    }
+
+    /// Spectral-whitened autocorrelation: divide the power spectrum by a locally
+    /// smoothed copy of itself, flattening the broad image-content envelope so the
+    /// watermark's periodic spectral peaks (and thus the lag-`period` peak) stand
+    /// out — at whatever frequency they sit, so it's scale-agnostic.
+    fn autocorr_2d_whitened(block: &[f32], b: usize, planner: &mut FftPlanner<f32>) -> Vec<f32> {
+        let n = 2 * b;
+        let mean = block.iter().sum::<f32>() / (b * b) as f32;
+        let mut buf = vec![Complex::new(0.0f32, 0.0); n * n];
+        for y in 0..b {
+            let wy = hann(y, b);
+            for x in 0..b {
+                buf[y * n + x] = Complex::new((block[y * b + x] - mean) * wy * hann(x, b), 0.0);
+            }
+        }
+        fft_2d(&mut buf, n, planner, false);
+        let power: Vec<f32> = buf.iter().map(|z| z.norm_sqr()).collect();
+        let env = box_blur(&power, n, 6); // content power envelope
+        for (z, (&p, &e)) in buf.iter_mut().zip(power.iter().zip(env.iter())) {
+            *z = Complex::new(p / (e + 1e-3), 0.0);
+        }
+        fft_2d(&mut buf, n, planner, true);
+        let norm = (n * n) as f32;
+        let mut out = vec![0.0f32; n * n];
+        for y in 0..n {
+            for x in 0..n {
+                out[((y + b) % n) * n + (x + b) % n] = buf[y * n + x].re / norm;
+            }
+        }
+        out
+    }
+
+    /// Wavelet band-pass: keep the mid detail levels (where the watermark lives),
+    /// zero the LL approximation and the finest level-1 detail, inverse-transform.
+    /// Content suppressor matched to the embedding band, broad enough for the scale
+    /// range we care about.
+    fn dwt_bandpass(block: &[f32], b: usize) -> Vec<f32> {
+        let mut c = block.to_vec();
+        dwt_2d_fwd(&mut c, b, b, DECOMP_DEPTH);
+        for &band in &[Subband::LH, Subband::HL, Subband::HH] {
+            let (r0, r1, c0, c1) = subband_bounds(b, b, 1, band); // drop finest detail
+            for r in r0..r1 { for cc in c0..c1 { c[r * b + cc] = 0.0; } }
+        }
+        let (r0, r1, c0, c1) = subband_bounds(b, b, DECOMP_DEPTH, Subband::LL); // drop coarse content
+        for r in r0..r1 { for cc in c0..c1 { c[r * b + cc] = 0.0; } }
+        dwt_2d_inv(&mut c, b, b, DECOMP_DEPTH);
+        c
+    }
+
+    /// Find the autocorrelation peak along the +x and +y axes near the expected
+    /// period, returning (detected_period_px, prominence) where prominence is the
+    /// peak over the mean |autocorr| of the off-peak band along those axes.
+    fn lattice_peak(ac: &[f32], n: usize, b: usize, period: f32) -> (f32, f32) {
+        let c = b; // centre (zero-lag) index
+        let lo = (period * 0.75).round() as usize;
+        let hi = ((period * 1.25).round() as usize).min(b - 2);
+        let mut px = (0usize, f32::MIN);
+        let mut py = (0usize, f32::MIN);
+        for lag in lo..=hi {
+            let vx = ac[c * n + (c + lag)];
+            if vx > px.1 { px = (lag, vx); }
+            let vy = ac[(c + lag) * n + c];
+            if vy > py.1 { py = (lag, vy); }
+        }
+        // Background: mean |ac| over lags [20, b) along both axes.
+        let mut bg = 0.0f32;
+        let mut m = 0usize;
+        for lag in 20..b {
+            bg += ac[c * n + (c + lag)].abs() + ac[(c + lag) * n + c].abs();
+            m += 2;
+        }
+        let bg = (bg / m as f32).max(1e-6);
+        let period_px = (px.0 + py.0) as f32 / 2.0;
+        let prominence = ((px.1 + py.1) / 2.0) / bg;
+        (period_px, prominence)
+    }
+
+    fn save_autocorr_png(ac: &[f32], n: usize, b: usize, path: &std::path::Path) {
+        // Zero a small central disk (the giant zero-lag lobe) so the lattice shows,
+        // then normalise to 0..255.
+        let mut v = ac.to_vec();
+        let c = b as isize;
+        for y in 0..n as isize {
+            for x in 0..n as isize {
+                if (x - c).pow(2) + (y - c).pow(2) < 12 * 12 { v[(y * n as isize + x) as usize] = 0.0; }
+            }
+        }
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for &x in &v { lo = lo.min(x); hi = hi.max(x); }
+        let span = (hi - lo).max(1e-6);
+        let px: Vec<u8> = v.iter().map(|x| (((x - lo) / span) * 255.0) as u8).collect();
+        image::save_buffer(path, &px, n as u32, n as u32, image::ColorType::L8).ok();
+    }
+
+    /// One measurement: embed (at `mask`), rescale to `s`, take a `b`-block at
+    /// (x0,y0); return (detected_period, blind_prominence, oracle_prominence).
+    /// `blind_y`/`delta` are the full-frame scaled watermarked Y and watermark delta.
+    // Returns (detected_period_from_spectral, prom_spectral, prom_dwt, prom_oracle).
+    fn autocorr_case(
+        blind_y: &[f32], delta: &[f32], sw: usize, x0: usize, y0: usize, b: usize,
+        period: f32, planner: &mut FftPlanner<f32>, png: Option<&std::path::Path>,
+    ) -> (f32, f32, f32, f32) {
+        let n = 2 * b;
+        let blk = extract_block(blind_y, sw, x0, y0, b);
+
+        let ac_sp = autocorr_2d_whitened(&blk, b, planner);
+        let (per_sp, prom_sp) = lattice_peak(&ac_sp, n, b, period);
+
+        let ac_dw = autocorr_2d(&dwt_bandpass(&blk, b), b, planner);
+        let (_pd, prom_dw) = lattice_peak(&ac_dw, n, b, period);
+
+        let dblk = extract_block(delta, sw, x0, y0, b);
+        let ac_or = autocorr_2d(&dblk, b, planner);
+        let (_po, prom_o) = lattice_peak(&ac_or, n, b, period);
+
+        if let Some(p) = png { save_autocorr_png(&ac_sp, n, b, p); }
+        (per_sp, prom_sp, prom_dw, prom_o)
+    }
+
+    #[test]
+    #[ignore]
+    fn registration_stage1() {
+        let tests_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().join("tests");
+        let reports = reports_dir();
+        let img = image::open(tests_dir.join("test_a.jpg")).unwrap().into_rgb8();
+        let (ow, oh) = (img.width() as usize, img.height() as usize);
+        let pixels = img.into_raw();
+        let orig_y = extract_y_rgb(&pixels);
+        let mut planner = FftPlanner::<f32>::new();
+        const TILE_PERIOD: f32 = (TILE_SIDE * 4) as f32; // level-2 spatial period @ embed scale
+
+        // Embed once per mask strength; keep wm_y and delta = wm_y - orig_y.
+        let embed_at = |mask: f32| -> (Vec<f32>, Vec<f32>) {
+            let mut wm = orig_y.clone();
+            embed_y_masked(&mut wm, ow, oh, &PHASE3_PAYLOAD, mask);
+            let delta: Vec<f32> = wm.iter().zip(orig_y.iter()).map(|(a, b)| a - b).collect();
+            (wm, delta)
+        };
+        let (wm_main, delta_main) = embed_at(MASK_STRENGTH);
+
+        // Rescale a full-frame Y by s (and return scaled dims).
+        let scale = |buf: &[f32], s: f32| -> (Vec<f32>, usize, usize) {
+            let nw = (ow as f32 * s).round() as usize;
+            let nh = (oh as f32 * s).round() as usize;
+            (resample_y(buf, ow, oh, nw, nh), nw, nh)
+        };
+
+        // ── Slice 1: block size × scale (centre block, masked embed) ──────────
+        let mut s1 = String::new();
+        for &b in &[256usize, 512, 1024] {
+            for &s in &[1.0f32, 0.7, 0.5, 0.33, 0.25] {
+                let (wm_s, sw, sh) = scale(&wm_main, s);
+                let (dl_s, _, _)   = scale(&delta_main, s);
+                if b + 2 > sw.min(sh) { // need room for the block (+slack)
+                    s1.push_str(&format!("| {:>4} | {:>4.2} | n/a (block > image) | | | | | |\n", b, s));
+                    continue;
+                }
+                let (x0, y0) = ((sw - b) / 2, (sh - b) / 2);
+                let period = TILE_PERIOD * s;
+                let png = if b == 512 && (s == 1.0 || s == 0.5 || s == 0.25) {
+                    Some(reports.join(format!("autocorr_b512_s{:02.0}.png", s * 100.0)))
+                } else { None };
+                let (per, prom_sp, prom_dw, prom_o) =
+                    autocorr_case(&wm_s, &dl_s, sw, x0, y0, b, period, &mut planner, png.as_deref());
+                let serr = (per / period - 1.0) * 100.0;
+                s1.push_str(&format!(
+                    "| {:>4} | {:>4.2} | {:>6.1} | {:>6.1} | {:>+5.1}% | {:>6.1} | {:>6.1} | {:>6.1} |\n",
+                    b, s, period, per, serr, prom_sp, prom_dw, prom_o));
+                println!("b={b} s={s:.2} per~{per:.0}/{period:.0} err{serr:+.1}% spectral={prom_sp:.1} dwt={prom_dw:.1} oracle={prom_o:.1}");
+            }
+        }
+
+        // ── Slice 2: masking strength × block content, at 512 / 0.5× ──────────
+        let b = 512usize;
+        let (wm_h, sw, sh) = scale(&wm_main, 0.5);
+        // Find busy / smooth 512-blocks by local variance over a grid.
+        let mut busy = (0usize, 0usize, f32::MIN);
+        let mut smooth = (0usize, 0usize, f32::MAX);
+        let step = (sw.min(sh) - b) / 3;
+        for gy in 0..4 { for gx in 0..4 {
+            let (x0, y0) = (gx * step, gy * step);
+            if x0 + b > sw || y0 + b > sh { continue; }
+            let blk = extract_block(&wm_h, sw, x0, y0, b);
+            let m = blk.iter().sum::<f32>() / blk.len() as f32;
+            let var = blk.iter().map(|v| (v - m) * (v - m)).sum::<f32>() / blk.len() as f32;
+            if var > busy.2 { busy = (x0, y0, var); }
+            if var < smooth.2 { smooth = (x0, y0, var); }
+        }}
+        let mut s2 = String::new();
+        for &mask in &[0.0f32, 0.5] {
+            let (wm_m, dl_m) = if mask == MASK_STRENGTH { (wm_main.clone(), delta_main.clone()) } else { embed_at(mask) };
+            let (wm_ms, mw, _) = scale(&wm_m, 0.5);
+            let (dl_ms, _, _)  = scale(&dl_m, 0.5);
+            for &(label, (x0, y0)) in &[("busy", (busy.0, busy.1)), ("smooth", (smooth.0, smooth.1))] {
+                let (_per, prom_sp, prom_dw, prom_o) =
+                    autocorr_case(&wm_ms, &dl_ms, mw, x0, y0, b, TILE_PERIOD * 0.5, &mut planner, None);
+                s2.push_str(&format!("| {:>4.1} | {:<6} | {:>6.1} | {:>6.1} | {:>6.1} |\n",
+                    mask, label, prom_sp, prom_dw, prom_o));
+                println!("mask={mask:.1} {label} spectral={prom_sp:.1} dwt={prom_dw:.1} oracle={prom_o:.1}");
+            }
+        }
+        let _ = (sh,);
+
+        // ── Slice 3: whitening method comparison at 512, scales 1.0× and 0.5× ──
+        let scales3 = [1.0f32, 0.5];
+        let mut cols: Vec<[f32; 5]> = Vec::new(); // [raw, highpass, spectral, dwt, oracle] per scale
+        for &s in &scales3 {
+            let (wm_s, sw3, sh3) = scale(&wm_main, s);
+            let (dl_s, _, _) = scale(&delta_main, s);
+            let (x0, y0) = ((sw3 - b) / 2, (sh3 - b) / 2);
+            let blk = extract_block(&wm_s, sw3, x0, y0, b);
+            let per = TILE_PERIOD * s;
+            let prom = |ac: &[f32], pl: &mut FftPlanner<f32>| { let _ = pl; lattice_peak(ac, 2 * b, b, per).1 };
+            let raw = prom(&autocorr_2d(&blk, b, &mut planner), &mut planner);
+            let hp  = prom(&autocorr_2d(&highpass(&blk, b, 16), b, &mut planner), &mut planner);
+            let sp  = prom(&autocorr_2d_whitened(&blk, b, &mut planner), &mut planner);
+            let dw  = prom(&autocorr_2d(&dwt_bandpass(&blk, b), b, &mut planner), &mut planner);
+            let orc = prom(&autocorr_2d(&extract_block(&dl_s, sw3, x0, y0, b), b, &mut planner), &mut planner);
+            cols.push([raw, hp, sp, dw, orc]);
+        }
+        let names = ["raw", "high-pass", "spectral", "dwt-band", "oracle Δ"];
+        let mut s3 = String::new();
+        for (i, nm) in names.iter().enumerate() {
+            s3.push_str(&format!("| {:<10} | {:>7.1} | {:>7.1} |\n", nm, cols[0][i], cols[1][i]));
+            println!("whitening {nm}: 1.0×={:.1}  0.5×={:.1}", cols[0][i], cols[1][i]);
+        }
+
+        let report = format!(
+"# Registration Stage 1 — does a 512×512 excerpt reveal the watermark period?
+
+Source: `tests/test_a.jpg` ({ow}×{oh}).  CDF 5/3, ALPHA={alpha}, levels {levels:?}.
+Level-2 tile period = {tp:.0} px at embed scale; in a B-px block at scale s there are
+B/(period·s) periods (≥2 needed).  **prominence** = autocorrelation peak ÷ off-peak band
+(≫1 = clear lattice; ~1 = invisible).  **oracle** = autocorrelation of the pure watermark
+delta (content removed) = the ceiling.  Blind methods: **spectral** = spectral-whitened
+autocorrelation (scale-agnostic), **dwt-band** = wavelet band-pass then autocorrelation.
+
+Regenerate: `cargo test -p glimr --release registration_stage1 -- --ignored --nocapture`
+
+## Slice 1 — block size × scale (centre block, masked embed @ {alpha_mask})
+
+| block | scale | period px | det px | scale err | spectral | dwt-band | oracle |
+|-------|-------|-----------|--------|-----------|----------|----------|--------|
+{s1}
+## Slice 2 — masking strength × block content (512 block, 0.5× scale)
+
+| mask | block  | spectral | dwt-band | oracle |
+|------|--------|----------|----------|--------|
+{s2}
+## Slice 3 — whitening method × scale (512 block, centre) — prominence
+
+| method     |   1.0× |   0.5× |
+|------------|--------|--------|
+{s3}
+Heatmaps (spectral-whitened autocorr): `autocorr_b512_s100.png` (1.0×), `_s50.png`
+(0.5×), `_s25.png` (0.25×) — the lattice should sharpen as scale drops.
+",
+            ow = ow, oh = oh, alpha = ALPHA, levels = EMBED_LEVELS, tp = TILE_PERIOD,
+            alpha_mask = MASK_STRENGTH, s1 = s1, s2 = s2, s3 = s3,
+        );
+        let path = reports.join("registration_stage1.md");
+        std::fs::write(&path, report).unwrap();
+        println!("registration stage 1 report → {}", path.display());
+    }
+
+    // ── Stage 2: blind registration + decode ──────────────────────────────────
+    //
+    // End-to-end blind pipeline (no size hint): recover scale (autocorrelation) →
+    // band-pass to the embed band → fold to one tile → keyed cross-correlation
+    // against per-bit spatial templates → the offset is the score peak and the
+    // per-bit correlation SIGNS are the payload.  Target: match the crop table's
+    // B-oracle (0 errors with the offset known).  Level-2 only (period 256) for v1.
+    //
+    //   cargo test -p glimr --release registration_stage2 -- --ignored --nocapture
+
+    const FOLD: usize = TILE_SIDE * 4; // level-2 spatial tile period = 256
+
+    /// Spatial footprint of one payload bit: pn_b tiled into LH2/HL2, inverse-DWT,
+    /// one FOLD×FOLD tile extracted from a clean interior region.
+    fn bit_template(bit: usize, planner: &mut FftPlanner<f32>) -> Vec<f32> {
+        let _ = planner;
+        let frame = 768usize;
+        let tile = pn_tile(bit);
+        let mut c = vec![0.0f32; frame * frame];
+        for &band in &[Subband::LH, Subband::HL] {
+            let (r0, r1, c0, c1) = subband_bounds(frame, frame, 2, band);
+            for r in r0..r1 {
+                for cc in c0..c1 {
+                    let ti = ((r - r0) % TILE_SIDE) * TILE_SIDE + (cc - c0) % TILE_SIDE;
+                    c[r * frame + cc] = tile[ti];
+                }
+            }
+        }
+        dwt_2d_inv(&mut c, frame, frame, DECOMP_DEPTH);
+        extract_block(&c, frame, FOLD, FOLD, FOLD) // interior tile at (256,256)
+    }
+
+    /// Band-pass an image to the level-2 detail band (keep LH2/HL2, zero the rest).
+    fn keep_level2(img: &[f32], w: usize, h: usize) -> Vec<f32> {
+        let mut c = img.to_vec();
+        dwt_2d_fwd(&mut c, w, h, DECOMP_DEPTH);
+        let keep_lh = subband_bounds(w, h, 2, Subband::LH);
+        let keep_hl = subband_bounds(w, h, 2, Subband::HL);
+        let mut out = vec![0.0f32; w * h];
+        for &(r0, r1, c0, c1) in &[keep_lh, keep_hl] {
+            for r in r0..r1 { for cc in c0..c1 { out[r * w + cc] = c[r * w + cc]; } }
+        }
+        dwt_2d_inv(&mut out, w, h, DECOMP_DEPTH);
+        out
+    }
+
+    /// Fold an image into one FOLD×FOLD tile by summing all period-FOLD shifts.
+    /// Content averages down (incoherent); the periodic watermark adds coherently.
+    fn fold_tile(img: &[f32], w: usize, h: usize) -> Vec<f32> {
+        let mut f = vec![0.0f32; FOLD * FOLD];
+        let (tw, th) = ((w / FOLD) * FOLD, (h / FOLD) * FOLD); // whole tiles only
+        for y in 0..th {
+            for x in 0..tw {
+                f[(y % FOLD) * FOLD + (x % FOLD)] += img[y * w + x];
+            }
+        }
+        f
+    }
+
+    /// Cyclic cross-correlation map (FOLD×FOLD): c[φ] = Σ_x a(x)·b(x−φ), via FFT.
+    fn xcorr_cyclic(a: &[f32], b: &[f32], planner: &mut FftPlanner<f32>) -> Vec<f32> {
+        let n = FOLD;
+        let mut fa: Vec<Complex<f32>> = a.iter().map(|&v| Complex::new(v, 0.0)).collect();
+        let mut fb: Vec<Complex<f32>> = b.iter().map(|&v| Complex::new(v, 0.0)).collect();
+        fft_2d(&mut fa, n, planner, false);
+        fft_2d(&mut fb, n, planner, false);
+        for (x, y) in fa.iter_mut().zip(fb.iter()) { *x *= y.conj(); }
+        fft_2d(&mut fa, n, planner, true);
+        let norm = (n * n) as f32;
+        fa.iter().map(|z| z.re / norm).collect()
+    }
+
+    /// Blind scale estimate from a block: spectral-whitened autocorrelation, take
+    /// the global peak over the plausible lag band, then fold down to the
+    /// fundamental (prefer L/2 while a comparable peak sits there).  Returns
+    /// estimated scale s = period_observed / FOLD, clamped to a sane range.
+    fn blind_scale(block: &[f32], b: usize, planner: &mut FftPlanner<f32>) -> f32 {
+        let ac = autocorr_2d_whitened(block, b, planner);
+        let n = 2 * b;
+        let c = b;
+        let (min_lag, max_lag) = (24usize, b - 2);
+        let prof: Vec<f32> = (0..max_lag)
+            .map(|lag| if lag < min_lag { f32::MIN } else { ac[c * n + c + lag].max(ac[(c + lag) * n + c]) })
+            .collect();
+        let mut peak = (min_lag, prof[min_lag]);
+        for lag in min_lag..max_lag { if prof[lag] > peak.1 { peak = (lag, prof[lag]); } }
+        let mut period = peak.0;
+        loop {
+            let cand = period / 2;
+            if cand < min_lag { break; }
+            let mut local = f32::MIN;
+            for l in (cand - 2)..=(cand + 2) { local = local.max(prof[l]); }
+            if local > 0.5 * peak.1 { period = cand; } else { break; }
+        }
+        (period as f32 / FOLD as f32).clamp(0.1, 3.0)
+    }
+
+    /// Blind decode at a chosen rescale target: rescale suspect → level-2 band-pass
+    /// → fold → keyed cross-correlation; returns (bit_errors, phase_prominence,
+    /// offset_x, offset_y).
+    fn decode_blind(
+        suspect: &[f32], nw: usize, nh: usize, tw: usize, th: usize,
+        templates: &[Vec<f32>], planner: &mut FftPlanner<f32>,
+    ) -> (usize, f32, usize, usize) {
+        let rescaled = resample_y(suspect, nw, nh, tw, th);
+        let band = keep_level2(&rescaled, tw, th);
+        let folded = fold_tile(&band, tw, th);
+        let mut score = vec![0.0f32; FOLD * FOLD];
+        let mut maps: Vec<Vec<f32>> = Vec::with_capacity(templates.len());
+        for t in templates {
+            let c = xcorr_cyclic(&folded, t, planner);
+            for (s_, v) in score.iter_mut().zip(c.iter()) { *s_ += v.abs(); }
+            maps.push(c);
+        }
+        let (mut bp, mut bv) = (0usize, f32::MIN);
+        for (i, &v) in score.iter().enumerate() { if v > bv { bv = v; bp = i; } }
+        let smed = { let mut s = score.clone(); s.sort_by(|a, b| a.partial_cmp(b).unwrap()); s[s.len()/2].max(1e-6) };
+        let mut bits = [false; PAYLOAD_BITS];
+        for (b, m) in maps.iter().enumerate() { bits[b] = m[bp] > 0.0; }
+        (crop_errs(&bits_to_payload(&bits)), bv / smed, bp % FOLD, bp / FOLD)
+    }
+
+    #[test]
+    #[ignore]
+    fn registration_stage2() {
+        let tests_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().join("tests");
+        let reports = reports_dir();
+        let img = image::open(tests_dir.join("test_a.jpg")).unwrap().into_rgb8();
+        let (ow, oh) = (img.width() as usize, img.height() as usize);
+        let pixels = img.into_raw();
+        let orig_y = extract_y_rgb(&pixels);
+        let mut planner = FftPlanner::<f32>::new();
+
+        // Embed once (masked), full frame.
+        let mut wm = orig_y.clone();
+        embed_y_masked(&mut wm, ow, oh, &PHASE3_PAYLOAD, MASK_STRENGTH);
+
+        // Precompute per-bit templates and their FFTs.
+        let templates: Vec<Vec<f32>> = (0..PAYLOAD_BITS).map(|b| bit_template(b, &mut planner)).collect();
+
+        // Resample helper.
+        let scale_to = |buf: &[f32], w: usize, h: usize, nw: usize, nh: usize| resample_y(buf, w, h, nw, nh);
+
+        let offsets = [("none", 0usize, 0usize), ("(37,53)", 37, 53), ("(130,200)", 130, 200), ("10% (250,250)", 250, 250)];
+        let scales = [1.0f32, 0.7, 0.5, 0.33];
+
+        let mut rows = String::new();
+        for &s in &scales {
+            for &(olabel, ox, oy) in &offsets {
+                // Build suspect: crop (origin shift ox,oy) then rescale by s.
+                let (cw, ch) = (ow - ox, oh - oy);
+                let cropped = crop_rgb_y(&wm, ow, ox, oy, cw, ch);
+                let (nw, nh) = ((cw as f32 * s).round() as usize, (ch as f32 * s).round() as usize);
+                let suspect = scale_to(&cropped, cw, ch, nw, nh);
+
+                // Blind scale from a centre block.
+                let sb = 512.min(nw).min(nh);
+                let blk = extract_block(&suspect, nw, (nw - sb) / 2, (nh - sb) / 2, sb);
+                let s_est = blind_scale(&blk, sb, &mut planner);
+                let s_err = (s_est / s - 1.0) * 100.0;
+
+                // Blind decode: rescale by the *estimated* inverse scale.
+                let inv = 1.0 / s_est;
+                let (tw_b, th_b) = ((nw as f32 * inv).round() as usize, (nh as f32 * inv).round() as usize);
+                let (eb, _pb, _, _) = decode_blind(&suspect, nw, nh, tw_b, th_b, &templates, &mut planner);
+
+                // Known-scale decode (oracle on scale only): rescale back to the
+                // cropped embed-scale dims (cw,ch).  Isolates the phase pipeline.
+                let (ek, pk, phx, phy) = decode_blind(&suspect, nw, nh, cw, ch, &templates, &mut planner);
+
+                rows.push_str(&format!(
+                    "| {:>4.2} | {:<13} | {:>+6.1}% | {:>3}/128 | {:>3}/128 | {:>5.0} | ({:>3},{:>3}) |\n",
+                    s, olabel, s_err, eb, ek, pk, phx, phy));
+                println!("s={s:.2} off={olabel} s_err={s_err:+.1}% errs_blind={eb} errs_known={ek} prom={pk:.0} phi=({phx},{phy})");
+            }
+        }
+
+        let report = format!(
+"# Registration Stage 2 — blind scale + offset recovery + decode
+
+Source: `tests/test_a.jpg` ({ow}×{oh}).  CDF 5/3, ALPHA={alpha}, levels {levels:?}, mask {mask}.
+Fully blind: recover scale (autocorrelation) → rescale → level-2 band-pass → fold to a
+{fold}-tile → keyed cross-correlation vs per-bit spatial templates.  The score peak is the
+crop offset (mod {fold}); the per-bit correlation signs are the payload.  Target = the crop
+table's B-oracle (0/128).  v1 uses level-2 only.
+
+Regenerate: `cargo test -p glimr --release registration_stage2 -- --ignored --nocapture`
+
+`errs blind` uses the blind scale estimate; `errs known` forces the true scale (rescale
+back to the cropped dims) to isolate the phase/decode pipeline from scale estimation.
+
+| scale | crop offset   | scale err | errs blind | errs known | phase prom | offset φ |
+|-------|---------------|-----------|------------|------------|------------|----------|
+{rows}
+_offset φ is the recovered (x,y) mod {fold} at known scale; phase prom = peak/median._
+",
+            ow = ow, oh = oh, alpha = ALPHA, levels = EMBED_LEVELS, mask = MASK_STRENGTH,
+            fold = FOLD, rows = rows,
+        );
+        let path = reports.join("registration_stage2.md");
+        std::fs::write(&path, report).unwrap();
+        println!("registration stage 2 report → {}", path.display());
+    }
+
+    // Crop a row-major RGB-derived Y? No — wm is Y (f32). Crop a Y sub-rectangle.
+    fn crop_rgb_y(src: &[f32], w: usize, x0: usize, y0: usize, cw: usize, ch: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; cw * ch];
+        for ry in 0..ch {
+            let s = (y0 + ry) * w + x0;
+            out[ry * cw..ry * cw + cw].copy_from_slice(&src[s..s + cw]);
+        }
+        out
     }
 }
