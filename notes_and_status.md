@@ -172,9 +172,12 @@ Two `sip.png` instances overlay `#lobjet_pane` (`z-index: 2`, `pointer-events: n
 - `wasm-pack build glimr --target web --out-dir ../pkg`; removes `pkg/.gitignore`
 - `cargo build --release -p packg -p deployg`; copies both to `tools/bin/`
 
-### Dev Server (`server.py`)
+### Dev Server
 
-`python server.py` — serves project root on port 8000 with `Cache-Control: no-store`.
+Local static serving is now handled by a separate external tool (outside this repo).
+`server.py` (was: `python server.py` serving the project root on :8000 with
+`Cache-Control: no-store`) has been **removed** — point your external server at the repo
+root; just ensure no-store / no-cache during development so WASM/JS edits aren't stale.
 
 ---
 
