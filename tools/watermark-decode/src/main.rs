@@ -123,23 +123,35 @@ fn blind_with_progress(y: &[f32], w: usize, h: usize, verbose: bool) -> watermar
     use watermark::registration::Progress::*;
     let bar = !verbose && std::io::stderr().is_terminal();
     let mut best_prom = 0.0f32;
+    // Verified/ECC marker for verbose lines.
+    let mark = |verified: bool, errors: u8| -> String {
+        if !verified { "✗".to_string() }
+        else if errors > 0 { format!("✓ CRC, ECC fixed {errors}") }
+        else { "✓ CRC".to_string() }
+    };
     let mut cb = |ev: watermark::registration::Progress| {
         match ev {
             Phase(p) => {
                 if verbose { eprintln!("  · {}…", p); }
-                else if bar { eprint!("\r  {:<38}", format!("{}…", p)); let _ = std::io::stderr().flush(); }
+                else if bar { eprint!("\r  {:<46}", format!("{}…", p)); let _ = std::io::stderr().flush(); }
             }
-            Scale(s) => {
-                if verbose { eprintln!("  · coarse scale ≈ {:.3}", s); }
-            }
-            Refine { step, total, scale, prominence, verified } => {
+            Candidate { rank, total, scale, strength, prominence, verified, errors } => {
                 if prominence > best_prom { best_prom = prominence; }
                 if verbose {
-                    eprintln!("  · refine {}/{}: scale {:.3}, prominence {:.1}{}",
-                        step, total, scale, prominence, if verified { ", CRC ✓" } else { "" });
+                    eprintln!("  · candidate {}/{}: scale {:.3} (autocorr {:.1}) → prominence {:.1}  {}",
+                        rank, total, scale, strength, prominence, mark(verified, errors));
                 } else if bar {
-                    eprint!("\r  recovering… refine {}/{}  best {:.1}{:<8}",
-                        step, total, best_prom, "");
+                    eprint!("\r  recovering… candidate {}/{}  best {:.1}{:<6}", rank, total, best_prom, "");
+                    let _ = std::io::stderr().flush();
+                }
+            }
+            Refine { candidate, scale, prominence, verified, errors } => {
+                if prominence > best_prom { best_prom = prominence; }
+                if verbose {
+                    eprintln!("  · refine (cand {}): scale {:.4} → prominence {:.1}  {}",
+                        candidate, scale, prominence, mark(verified, errors));
+                } else if bar {
+                    eprint!("\r  recovering… refining (cand {})  best {:.1}{:<6}", candidate, best_prom, "");
                     let _ = std::io::stderr().flush();
                 }
             }

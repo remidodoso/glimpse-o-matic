@@ -273,9 +273,10 @@ Detailed design + tuning rationale live in `watermarking.md`; measured data in
 - JPEG q70–90: **0 errors**. Resize 50–120% (size known): **0 errors**.
 - Crop is a **registration** problem, not signal loss (`crop_tolerance.md`): pad-at-known-offset
   decodes 0 errors to a 10% edge crop; blind auto now recovers the offset itself.
-- **Blind sweep (`blind_auto_sweep.md`): 36/40 cells clean & CRC-verified** after the
-  scale-window fix (512→1024 block recovered 10 of 12 full-scale failures). Remaining 4 misses:
-  2 are 1-bit ECC targets (test_a 0.50× + crop), 2 are hard-scale (test_e q80 1.0×).
+- **Blind sweep (`blind_auto_sweep.md`):** this was 36/40 in the pre-ECC era; **now 40/40 clean &
+  CRC-verified** after ECC + the Phase-7 blind-robustness work (candidate diversity + harmonic
+  siblings). Real cropped screenshots that previously failed (`tests/failed_crops/`) now decode too.
+  See *ECC + Characterization Status & Findings* below for the current picture.
 - **Real-world: every screenshot capture CRC-verified blind** — downscale (to 0.42×), crop,
   partial occlusion (gray bar), JPEG recompression; consistent browser fp `6effd55f`.
 - **`sstest7` — first wild few-bit failure (ECC poster child):** significant crop at a
@@ -296,7 +297,7 @@ Detailed design + tuning rationale live in `watermarking.md`; measured data in
 - **`tests/reports/`**: `.md` tracked as living docs, heatmap PNGs gitignored. `tests/test_a.jpg`
   force-tracked past the `*.jpg` ignore.
 
-**Next — ECC (queued, design agreed):**
+**Next — ECC (DONE — Phases 1–4 shipped; see *ECC + Characterization Status & Findings* below for status, Phase-5 measurements, and the Phase-6 luminance-masking result). Original design:**
 - Pipeline: receive 192 hard bits → **BCH-correct** → split 160 → CRC32 over the 128 data bits →
   certify. CRC stays the final oracle (ECC proposes, CRC disposes → no false-certification risk).
 - **v1: shortened BCH(192, 160) over GF(2⁸), t = 4** (32 parity bits = the reserved field; t=4 is
@@ -384,6 +385,100 @@ Precise geolocation needs a **permission prompt** = friction against the zero-fr
 most viewers deny it; IP already yields coarse geo server-side later for free. Lean: a **DB-era
 field keyed by `event_id`**, or a deliberate/optional prompt if added in the static era — a
 semantic-layer/version change either way.
+
+---
+
+## Watermarking — ECC + Characterization Status & Findings (2026-06-07)
+
+Implementation progress on the replanned phases, the Phase-5 measurements, and the Phase-6 result.
+
+### Done — ECC v1 + payload-evolution structure (Phases 1–4)
+- **BCH(192,160) t=4** over GF(2⁸) (`watermark::bch`): systematic encode (LFSR division) + decode
+  (syndromes → Berlekamp–Massey → Chien → bit-flip), shortened from BCH(255,223). Standalone,
+  dependency-free, unit-tested (every single-bit error corrected; 1–4 random errors rescued; ≥5
+  never falsely accepted).
+- **Embed** fills the reserved 32 bits with parity (`full_payload`); **decode** routes every path
+  through `decode_bits` with **CRC-first → ECC-on-failure → CRC-recheck** (a clean read is never
+  disturbed; CRC stays the final oracle, false-accept ~2⁻³²). `Decoded`/`BlindResult` carry
+  `errors_corrected`; the CLI surfaces it ("· ECC corrected N bit errors").
+- **Generation/version structure:** `Generation`/`GEN1` names the frozen channel layer; `decode_bits`
+  has the generation-dispatch seam; CLI `print_fields` dispatches on the payload `version` byte
+  (`_ => raw dump`, never mislabels an unknown format). Unit-tested.
+- WASM rebuilt to embed parity (after Phase 3). Default `cargo test` ~5s; heavy sweeps stay `#[ignore]`.
+
+### Phase 5 — characterization (3 `#[ignore]` reports in `tests/reports/`)
+- **`channel_waterfall.md`** (matched decode, registration removed as a variable): at good
+  registration the error count rises *gradually* with falling quality — native test_a: 0 errs to
+  q25, then 1·2·4 at q20·q15·q10, **all ECC-rescued**; 0.5× cells: 1·3·4 rescued, lost at ≥5. So
+  **the bimodality seen in the wild is structural & expected**, the 1–4 band is real, and **t=4 is
+  well-sized** (ECC buys ≈ one quality tier). Soft-decision would extend the 5–6-error cells only
+  marginally.
+- **`scale_precision.md`**: the registration cliff is a **near-step function** — alignment score
+  111.6 → ~10 and errors 0 → ~120 at just ±0.25% scale error. The **score is a clean monotonic
+  objective** (good for Phase-8), but the 0-error notch is **narrower than the autocorr integer-lag
+  resolution (~0.4% at period 256)** and the ±0.5% refine step → blind success currently depends on a
+  refine rung happening to land in the notch. Strengthens the case for finer, score-guided refinement.
+- **`sync_mechanism.md`** (the smoking gun): on white-seamless test_e at s=1.0, a **spurious lag-190
+  autocorr peak outranks the true tile period (lag 256)** → blind picks scale 0.746 (the −25.4% gross
+  error). **Matched `--size` decode still verifies → the signal survives** → purely a *coarse-sync*
+  failure, never ECC/signal-loss. Detail-rich test_a ranks the true period #1. `registration::scale_peaks`
+  was added as the diagnostic (and is the seed for Phase-7 candidate diversity).
+
+### Phase 6 — luminance masking: ATTEMPTED, BACKFIRED (decision pending)
+Added a luminance term to `masking_gain` (boost highlights / suppress low-to-mid via `lum_gain`,
+constants `LUM_MID_GAIN`/`LUM_HI_GAIN`/`LUM_KNEE_LO`/`LUM_KNEE_HI`), energy-neutral via the mean-1
+renorm. **Measured result was a net negative:**
+- **Sync regressed:** test_e s=1.0 true-period rank **#2 → absent** (blind still fails). No fix.
+- **0.5× robustness slightly worse** (a couple of previously ECC-rescued cells lost — real, same
+  code-basis comparison vs the Phase-5 run).
+- **PSNR effect negligible** (post-revert 43.7/43.1 dB vs Phase-6 43.8/43.3 — energy-neutral, as
+  designed). An earlier "−1.7 dB" claim was a *stale-baseline* artifact (compared to ~45.5 from a
+  different context), not a real cost; the decision to revert rests on the sync/robustness regression,
+  not PSNR.
+- **Why the premise was wrong:** the watermark's *sync* signal comes from the model's **midtone
+  detail**, not the flat highlights (test_e ranked #2 *because* of the textured model). The uniform
+  luminance multiply suppressed *busy* midtones too — removing the sync source — while boosting flat
+  white, where JPEG + clipping destroy periodicity. **Flat highlights are the *worst* place for sync.**
+- **Code state: REVERTED.** The luminance masking (constants, `lum_gain`, `masking_gain` change)
+  was rolled back; embed is back to activity-only masking, which matches the shipped `pkg` WASM
+  (built post-Phase-3), so no rebuild was needed. Kept: `emit_visual_samples` generalized to
+  test_a + test_e and marked `#[ignore]` (residuals in `tests/sample_{a,e}_*.png`).
+
+### Revised remaining plan
+- **Phase 6: REVERTED** (2026-06-07). The sync fix is not the embed. (If orange peel ever proves
+  worth fixing, the *perceptual-only* form — luminance suppression gated to low-activity regions,
+  no aggressive highlight boost — is the way; it's a separate quality tweak, not a sync lever.)
+- **Phase 7 — Lever B (Tier-A candidate diversity): DONE (2026-06-07).** `decode_blind_auto` now
+  tries the **top-4 autocorr scale peaks** (`scale_peaks`), strongest-first, each decoded with CRC+ECC
+  as the verdict — **first verify wins**; the ±refine ladder (on the top-2 candidates) is deferred to
+  *only* when no coarse candidate verifies ("save refine for when ECC fails"). Removed the old
+  single-peak `blind_scale` + halving heuristic (candidate diversity supersedes it). Results:
+  **`blind_auto_sweep` 40/40 clean & CRC-verified** (the test_e gross-sync cells now pass);
+  **test_e s=1.0 locks** via candidate #2 (true period at rank #2; scale 0.746→1.000); sweep runtime
+  ~halved (clean cells verify at candidate #1, skipping refine). `--verbose` narrates each candidate
+  (rank, scale, autocorr strength, prominence, CRC/ECC result) + the refine pass. Phase 7 touched only
+  the decode path → embed unchanged → **no WASM rebuild needed.**
+- **Phase 7 — harmonic-sibling candidates: DONE (2026-06-08).** Real failing crops in
+  `tests/failed_crops/` (sstest13/15/16) — *not* white-seamless, just significant crops — now decode.
+  Diagnosis (diagnostics `brute_scale_failed_crops`→`brute_scale.md`, `scale_peak_ranks`→
+  `scale_peak_ranks.md`; helpers `registration::scale_sweep`, `scale_peaks_multi`): a brute CRC-gated
+  scale sweep recovered all of them **cleanly (prominence 4.7–6.6, 0 ECC errors, fold-tiles 6–9)** ⇒
+  **100% coarse scale-*detection*, not size/SNR**. The peak-ranking dump showed the universal pattern:
+  **downscaling low-passes the mark, so the strongest autocorr peak is the level-3 / 2× harmonic and
+  the true (level-2) period is its ½×** (sstest13 259→true 130; sstest15/16 287→143/142). The detail-
+  block idea was a red herring (premised on white-seamless, which these are not); multi-block helped
+  only oblong crops and not square ones.
+  - **Fix:** in `decode_blind_auto_cb`, expand each top-K autocorr peak into `{s, s/2, s/3}` harmonics
+    (re-introduces the old period-halving, now as CRC-gated candidate diversity). First CRC/ECC-verify
+    wins; refine the top-`REFINE_CANDIDATES`(=4) of the expanded list only on total coarse failure.
+    Removed the old `blind_scale`.
+  - **Results:** sstest13/15/16 verify via **candidate 2/12** (= ½× of #1), prominence 4.4–6.1, fast
+    (clean cases still verify at candidate 1; harmonics only add tries on failure). **`blind_auto_sweep`
+    40/40 held** (a transient single-best-refine simplification regressed test_d → fixed by refining the
+    top-4 expanded candidates). Decode-only change → **WASM unaffected**; binary synced to `tools/bin`.
+  - `--verbose` shows the harmonic path (`candidate 1/12: scale 1.012 ✗` → `2/12: scale 0.506 ✓ CRC`).
+- **Phase 8 (conditional, low priority):** fine-scale CRC-gated refinement on the score objective —
+  more justified now (cliff narrower than coarse resolution) but secondary to Phase 7.
 
 ---
 
