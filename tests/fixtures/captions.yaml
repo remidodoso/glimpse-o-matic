@@ -1,0 +1,34 @@
+# Captions & tags for the demonstration fixtures in this directory.
+# Consumed by the test/demo report generator to label each image in the
+# generated reports (tests/reports/*.{md,html}).
+#
+# Schema — one entry per fixture file:
+#   <filename>:
+#     caption: "Short human-readable caption shown beneath the image"
+#     tags:    [free-form, descriptors]   # e.g. detail-rich, white-seamless, low-detail, portrait
+#
+# Fixtures without an entry fall back to the bare filename.
+# (Placeholder content — fill in.)
+#
+# The "canonical" tag indicates the image that will be used by default for
+# tests.
+
+collibrina.jpg:
+  caption: "Collibrina"
+  tags: [skintones]
+
+fairbanks.jpg:
+  caption: "Fairbanks Aurora"
+  tags: [dark, landscape]
+
+quyen.jpg:                            # canonical single-image fixture (was test_a.jpg)
+  caption: "Quyen"
+  tags: [colorful, busy, canonical]
+
+riley.jpg:
+  caption: "Riley"
+  tags: [high-key, negative-space, white-seamless]
+
+zia.jpg:
+  caption: "Zia"
+  tags: [monochrome, grain]

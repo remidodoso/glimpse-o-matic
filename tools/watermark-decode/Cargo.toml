@@ -9,3 +9,4 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+serde_yaml = "0.9"   # read tests/fixtures/captions.yaml for canonical-fixture selection

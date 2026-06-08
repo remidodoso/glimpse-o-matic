@@ -10,12 +10,38 @@ fn write_y_delta_rgb(pixels: &mut [u8], y_orig: &[f32], y_new: &[f32]) {
     }
 }
 
-fn test_image_path() -> std::path::PathBuf {
+fn fixtures_dir() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap()
-        .parent().unwrap()
-        .join("tests")
-        .join("test_a.jpg")
+        .parent().unwrap().parent().unwrap()
+        .join("tests").join("fixtures")
+}
+
+/// Default fixture: first entry tagged `canonical` in fixtures/captions.yaml,
+/// else the first entry, else the first `.jpg`.
+fn test_image_path() -> std::path::PathBuf {
+    let dir = fixtures_dir();
+    if let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(
+        &std::fs::read_to_string(dir.join("captions.yaml")).unwrap_or_default())
+    {
+        if let Some(map) = doc.as_mapping() {
+            let mut first: Option<String> = None;
+            for (k, v) in map {
+                let name = match k.as_str() { Some(s) => s, None => continue };
+                if first.is_none() { first = Some(name.to_string()); }
+                let canon = v.get("tags").and_then(|t| t.as_sequence())
+                    .map(|t| t.iter().any(|x| x.as_str() == Some("canonical")))
+                    .unwrap_or(false);
+                if canon { return dir.join(name); }
+            }
+            if let Some(f) = first { return dir.join(f); }
+        }
+    }
+    let mut jpgs: Vec<_> = std::fs::read_dir(&dir).unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().map(|x| x == "jpg" || x == "jpeg").unwrap_or(false))
+        .collect();
+    jpgs.sort();
+    jpgs.into_iter().next().expect("no .jpg fixtures in tests/fixtures")
 }
 
 #[test]
