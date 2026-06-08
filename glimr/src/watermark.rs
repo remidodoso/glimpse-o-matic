@@ -9,8 +9,53 @@ pub const ALPHA:        f32    = 0.15;
 pub const EMBED_LEVELS: &[u32] = &[2, 3];
 pub const TILE_SIDE:    usize  = 64;   // PN grid: each subband normalized to TILE_SIDE×TILE_SIDE
 pub const DECOMP_DEPTH:  u32   = 4;
-pub const PAYLOAD_BITS:  usize = 128;
+
+// Payload layout (192 embedded bits = 24 bytes):
+//   bytes  0..16  data       (the 128-bit message JS assembles)
+//   bytes 16..20  CRC-32 of the data (LE)  — verification
+//   bytes 20..24  reserved for ECC parity  — zero for now
+// `embed_y` takes the 16 data bytes; the CRC is computed in WASM (one Rust place,
+// shared with the decoder), so the JS boundary stays 16 bytes.
+pub const PAYLOAD_BITS:  usize = 192;  // total embedded bits
+pub const DATA_BYTES:    usize = 16;   // message bytes (128 data bits)
+pub const FULL_BYTES:    usize = 24;   // data + CRC + reserved-ECC
 pub const RESIDUAL_AMP:  f32   = 20.0;
+
+/// Decoded result: the 16 data bytes plus whether the embedded CRC matched.
+#[derive(Clone, Copy, Debug)]
+pub struct Decoded {
+    pub data:     [u8; DATA_BYTES],
+    pub verified: bool, // CRC-32 over `data` matches the embedded checksum
+}
+
+/// CRC-32 (IEEE 802.3, reflected poly 0xEDB88320), bitwise — tiny payload, no table.
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+
+/// Assemble the 24-byte embedded payload from the 16 data bytes: data ++ CRC32(data) ++ zeros(ECC).
+fn full_payload(data: &[u8; DATA_BYTES]) -> [u8; FULL_BYTES] {
+    let mut full = [0u8; FULL_BYTES];
+    full[..DATA_BYTES].copy_from_slice(data);
+    full[DATA_BYTES..DATA_BYTES + 4].copy_from_slice(&crc32(data).to_le_bytes());
+    // bytes 20..24 left zero (reserved for ECC parity)
+    full
+}
+
+/// Split a decoded 24-byte payload into data + CRC-verification.
+fn split_payload(full: &[u8; FULL_BYTES]) -> Decoded {
+    let mut data = [0u8; DATA_BYTES];
+    data.copy_from_slice(&full[..DATA_BYTES]);
+    let crc_embedded = u32::from_le_bytes([full[16], full[17], full[18], full[19]]);
+    Decoded { data, verified: crc32(&data) == crc_embedded }
+}
 
 // Perceptual masking (Stage 2): per-coefficient embedding strength is scaled by
 // local detail energy, then renormalized to mean 1 (energy-neutral — detection
@@ -244,7 +289,7 @@ fn pn_tile(bit_idx: usize) -> Vec<f32> {
 
 // ── Payload ↔ bits ────────────────────────────────────────────────────────────
 
-fn payload_to_bits(payload: &[u8; 16]) -> [bool; PAYLOAD_BITS] {
+fn payload_to_bits(payload: &[u8; FULL_BYTES]) -> [bool; PAYLOAD_BITS] {
     let mut bits = [false; PAYLOAD_BITS];
     for (b, &byte) in payload.iter().enumerate() {
         for k in 0..8 { bits[b * 8 + k] = (byte >> k) & 1 == 1; }
@@ -252,8 +297,8 @@ fn payload_to_bits(payload: &[u8; 16]) -> [bool; PAYLOAD_BITS] {
     bits
 }
 
-fn bits_to_payload(bits: &[bool; PAYLOAD_BITS]) -> [u8; 16] {
-    let mut out = [0u8; 16];
+fn bits_to_payload(bits: &[bool; PAYLOAD_BITS]) -> [u8; FULL_BYTES] {
+    let mut out = [0u8; FULL_BYTES];
     for (b, byte) in out.iter_mut().enumerate() {
         for k in 0..8 { if bits[b * 8 + k] { *byte |= 1 << k; } }
     }
@@ -480,16 +525,16 @@ fn resample_y(src: &[f32], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<f3
 
 /// Embed `payload` (16 bytes = 128 bits) into the Y channel in-place.
 /// `y` is a row-major f32 array of `width × height` luminance values.
-pub fn embed_y(y: &mut [f32], width: usize, height: usize, payload: &[u8; 16]) {
+pub fn embed_y(y: &mut [f32], width: usize, height: usize, payload: &[u8; DATA_BYTES]) {
     embed_y_masked(y, width, height, payload, MASK_STRENGTH);
 }
 
 /// Like `embed_y` but with an explicit perceptual-masking blend strength
 /// (0 = uniform, 1 = full). Exposed so experiments can compare masked vs uniform
 /// embedding (e.g. its effect on the watermark's self-synchronizing periodicity).
-pub fn embed_y_masked(y: &mut [f32], width: usize, height: usize, payload: &[u8; 16], mask_strength: f32) {
+pub fn embed_y_masked(y: &mut [f32], width: usize, height: usize, payload: &[u8; DATA_BYTES], mask_strength: f32) {
     dwt_2d_fwd(y, width, height, DECOMP_DEPTH);
-    let bits = payload_to_bits(payload);
+    let bits = payload_to_bits(&full_payload(payload)); // data + CRC + reserved-ECC → 192 bits
     for &level in EMBED_LEVELS {
         // Masking gain from this level's detail energy, before it is modified.
         let (gain, gsh, gsw) = masking_gain(y, width, height, level, mask_strength);
@@ -505,11 +550,11 @@ pub fn embed_y_masked(y: &mut [f32], width: usize, height: usize, payload: &[u8;
 
 /// Blindly decode the watermark payload from the Y channel (no original needed).
 /// Aggregates correlation evidence across all embedded subbands and levels.
-pub fn decode_y(y: &[f32], width: usize, height: usize) -> [u8; 16] {
+pub fn decode_y(y: &[f32], width: usize, height: usize) -> [u8; DATA_BYTES] {
     let total = correlate_embed_levels(y, width, height);
     let mut bits = [false; PAYLOAD_BITS];
     for (i, b) in bits.iter_mut().enumerate() { *b = total[i] > 0.0; }
-    bits_to_payload(&bits)
+    split_payload(&bits_to_payload(&bits)).data
 }
 
 /// Accumulate per-bit correlation over exactly the embedded subbands
@@ -545,8 +590,8 @@ fn correlate_embed_levels(y: &[f32], width: usize, height: usize) -> [f32; PAYLO
 ///
 /// Returns the recovered payload.  Use `decode_y_at_size_verbose` for the
 /// alignment score (a detection-confidence / gallery-matching metric).
-pub fn decode_y_at_size(y: &[f32], width: usize, height: usize, orig_w: usize, orig_h: usize) -> [u8; 16] {
-    decode_y_at_size_verbose(y, width, height, orig_w, orig_h).0
+pub fn decode_y_at_size(y: &[f32], width: usize, height: usize, orig_w: usize, orig_h: usize) -> [u8; DATA_BYTES] {
+    decode_y_at_size_verbose(y, width, height, orig_w, orig_h).0.data
 }
 
 /// Alignment-score thresholds for interpreting `decode_y_at_size_verbose`.
@@ -565,13 +610,13 @@ pub fn detection_floor()  -> f32 { PAYLOAD_BITS as f32 * ALPHA * 0.9 }
 /// gallery sizes and taking the peak identifies which source image leaked.
 pub fn decode_y_at_size_verbose(
     y: &[f32], width: usize, height: usize, orig_w: usize, orig_h: usize,
-) -> ([u8; 16], f32) {
+) -> (Decoded, f32) {
     let regridded = resample_y(y, width, height, orig_w, orig_h);
     let total = correlate_embed_levels(&regridded, orig_w, orig_h);
     let score: f32 = total.iter().map(|v| v.abs()).sum();
     let mut bits = [false; PAYLOAD_BITS];
     for (i, b) in bits.iter_mut().enumerate() { *b = total[i] > 0.0; }
-    (bits_to_payload(&bits), score)
+    (split_payload(&bits_to_payload(&bits)), score)
 }
 
 // ── Debug / visual verification ──────────────────────────────────────────────
@@ -587,6 +632,252 @@ pub fn emit_residual(y_orig: &[f32], y_new: &[f32], amp: f32) -> Vec<u8> {
             [v, v, v]
         })
         .collect()
+}
+
+// ── Blind registration + decode (native-only; gated by `registration`) ─────────
+//
+// Productized from the Stage 1/2 experiments.  Given a suspect Y plane that has
+// been arbitrarily cropped and/or rescaled, recover the scale (autocorrelation of
+// the watermark's periodic tiling) and the crop offset (keyed matched filter on
+// the folded tile), then read the payload from the per-bit correlation signs — no
+// original image or known dimensions required.  Uses an FFT (rustfft), so it is
+// feature-gated to keep it out of the WASM build.
+
+#[cfg(feature = "registration")]
+pub mod registration {
+    use super::*;
+    use rustfft::{num_complex::Complex, FftPlanner};
+
+    /// Matched-filter fold period (px @ embed scale).  LCM of the level-2 tile
+    /// period (TILE_SIDE·4 = 256) and the level-3 tile period (TILE_SIDE·8 = 512),
+    /// so both embedded levels align under one fold.
+    pub const FOLD: usize = TILE_SIDE * 8; // 512
+    /// Reference period the *scale* is measured against (level-2 = dominant).
+    const SCALE_REF: usize = TILE_SIDE * 4; // 256
+    const REFINE_STEPS: i32 = 2;            // ± this many 0.5% scale nudges
+    const REFINE_FRAC:  f32 = 0.005;
+    // Scale-estimation block: 1024 holds ≥4 tile periods even at full scale (a 512
+    // block holds only 2 → weak/ambiguous autocorr peak, which caused the full-scale
+    // misses in the sweep).  Stage-1 prominence at 1.0×: ~18 (512) vs ~111 (1024).
+    const SCALE_BLOCK: usize = 1024;
+
+    /// Outcome of a blind decode.
+    pub struct BlindResult {
+        pub data:       [u8; DATA_BYTES],
+        pub verified:   bool,          // CRC-32 over `data` matched the embedded checksum
+        pub scale:      f32,            // recovered suspect scale (≈ size / original)
+        pub offset:     (usize, usize),// recovered tile-phase offset (mod FOLD)
+        pub confidence: f32,           // phase-peak prominence (peak ÷ median); ≫1 = solid
+    }
+
+    // ── small FFT / DSP helpers ──
+    fn fft_2d(buf: &mut [Complex<f32>], n: usize, planner: &mut FftPlanner<f32>, inv: bool) {
+        let fft = if inv { planner.plan_fft_inverse(n) } else { planner.plan_fft_forward(n) };
+        for r in 0..n { fft.process(&mut buf[r * n..r * n + n]); }
+        let mut col = vec![Complex::new(0.0, 0.0); n];
+        for c in 0..n {
+            for r in 0..n { col[r] = buf[r * n + c]; }
+            fft.process(&mut col);
+            for r in 0..n { buf[r * n + c] = col[r]; }
+        }
+    }
+
+    fn hann(i: usize, n: usize) -> f32 { let x = std::f32::consts::PI * i as f32 / (n as f32 - 1.0); x.sin() * x.sin() }
+
+    fn box_blur(src: &[f32], b: usize, radius: usize) -> Vec<f32> {
+        let k = (2 * radius + 1) as f32;
+        let mut tmp = vec![0.0f32; b * b];
+        for y in 0..b { for x in 0..b {
+            let mut s = 0.0;
+            for d in 0..=2 * radius { let xx = (x as isize + d as isize - radius as isize).clamp(0, b as isize - 1) as usize; s += src[y * b + xx]; }
+            tmp[y * b + x] = s / k;
+        }}
+        let mut out = vec![0.0f32; b * b];
+        for x in 0..b { for y in 0..b {
+            let mut s = 0.0;
+            for d in 0..=2 * radius { let yy = (y as isize + d as isize - radius as isize).clamp(0, b as isize - 1) as usize; s += tmp[yy * b + x]; }
+            out[y * b + x] = s / k;
+        }}
+        out
+    }
+
+    fn extract(src: &[f32], w: usize, x0: usize, y0: usize, b: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; b * b];
+        for ry in 0..b { let s = (y0 + ry) * w + x0; out[ry * b..ry * b + b].copy_from_slice(&src[s..s + b]); }
+        out
+    }
+
+    /// Spectral-whitened autocorrelation of a b×b block (2b×2b, zero-lag centred).
+    fn autocorr_whitened(block: &[f32], b: usize, planner: &mut FftPlanner<f32>) -> Vec<f32> {
+        let n = 2 * b;
+        let mean = block.iter().sum::<f32>() / (b * b) as f32;
+        let mut buf = vec![Complex::new(0.0f32, 0.0); n * n];
+        for y in 0..b { let wy = hann(y, b); for x in 0..b {
+            buf[y * n + x] = Complex::new((block[y * b + x] - mean) * wy * hann(x, b), 0.0);
+        }}
+        fft_2d(&mut buf, n, planner, false);
+        let power: Vec<f32> = buf.iter().map(|z| z.norm_sqr()).collect();
+        let env = box_blur(&power, n, 6);
+        for (z, (&p, &e)) in buf.iter_mut().zip(power.iter().zip(env.iter())) { *z = Complex::new(p / (e + 1e-3), 0.0); }
+        fft_2d(&mut buf, n, planner, true);
+        let norm = (n * n) as f32;
+        let mut out = vec![0.0f32; n * n];
+        for y in 0..n { for x in 0..n { out[((y + b) % n) * n + (x + b) % n] = buf[y * n + x].re / norm; } }
+        out
+    }
+
+    /// Estimate suspect scale from a block: global autocorrelation peak over the
+    /// plausible lag band, folded down to the fundamental.  s = period / SCALE_REF.
+    fn blind_scale(block: &[f32], b: usize, planner: &mut FftPlanner<f32>) -> f32 {
+        let ac = autocorr_whitened(block, b, planner);
+        let n = 2 * b;
+        let c = b;
+        let (min_lag, max_lag) = (24usize, b - 2);
+        let prof: Vec<f32> = (0..max_lag)
+            .map(|lag| if lag < min_lag { f32::MIN } else { ac[c * n + c + lag].max(ac[(c + lag) * n + c]) })
+            .collect();
+        let mut peak = (min_lag, prof[min_lag]);
+        for lag in min_lag..max_lag { if prof[lag] > peak.1 { peak = (lag, prof[lag]); } }
+        let mut period = peak.0;
+        loop {
+            let cand = period / 2;
+            if cand < min_lag { break; }
+            let mut local = f32::MIN;
+            for l in (cand - 2)..=(cand + 2) { local = local.max(prof[l]); }
+            if local > 0.5 * peak.1 { period = cand; } else { break; }
+        }
+        (period as f32 / SCALE_REF as f32).clamp(0.1, 4.0)
+    }
+
+    /// Per-bit spatial templates: pn_b tiled into the embed bands (LH/HL at
+    /// EMBED_LEVELS), inverse-DWT, one FOLD×FOLD interior tile.  Payload-independent
+    /// references; the secret key (WM_KEY via pn_tile) is what makes them keyed.
+    fn bit_templates() -> Vec<Vec<f32>> {
+        let frame = 2 * FOLD; // 1024 — interior tile avoids inverse-DWT edge effects
+        (0..PAYLOAD_BITS).map(|bit| {
+            let tile = pn_tile(bit);
+            let mut c = vec![0.0f32; frame * frame];
+            for &level in EMBED_LEVELS {
+                for &band in &[Subband::LH, Subband::HL] {
+                    let (r0, r1, c0, c1) = subband_bounds(frame, frame, level, band);
+                    for r in r0..r1 { for cc in c0..c1 {
+                        let ti = ((r - r0) % TILE_SIDE) * TILE_SIDE + (cc - c0) % TILE_SIDE;
+                        c[r * frame + cc] = tile[ti];
+                    }}
+                }
+            }
+            dwt_2d_inv(&mut c, frame, frame, DECOMP_DEPTH);
+            extract(&c, frame, FOLD / 2, FOLD / 2, FOLD) // tile at (256,256)
+        }).collect()
+    }
+
+    /// Band-pass an image to the embed detail bands (keep LH/HL at EMBED_LEVELS).
+    fn keep_embed_bands(img: &[f32], w: usize, h: usize) -> Vec<f32> {
+        let mut c = img.to_vec();
+        dwt_2d_fwd(&mut c, w, h, DECOMP_DEPTH);
+        let mut out = vec![0.0f32; w * h];
+        for &level in EMBED_LEVELS {
+            for &band in &[Subband::LH, Subband::HL] {
+                let (r0, r1, c0, c1) = subband_bounds(w, h, level, band);
+                for r in r0..r1 { for cc in c0..c1 { out[r * w + cc] = c[r * w + cc]; } }
+            }
+        }
+        dwt_2d_inv(&mut out, w, h, DECOMP_DEPTH);
+        out
+    }
+
+    /// Fold an image into one FOLD×FOLD tile by summing all whole period-FOLD shifts.
+    fn fold_tile(img: &[f32], w: usize, h: usize) -> Vec<f32> {
+        let mut f = vec![0.0f32; FOLD * FOLD];
+        let (tw, th) = ((w / FOLD) * FOLD, (h / FOLD) * FOLD);
+        for y in 0..th { for x in 0..tw { f[(y % FOLD) * FOLD + (x % FOLD)] += img[y * w + x]; } }
+        f
+    }
+
+    /// Register + decode at a chosen rescale target.  Returns (payload, prominence,
+    /// offset_x, offset_y).  `tfft` are the precomputed template FFTs.
+    fn register_decode(
+        suspect: &[f32], nw: usize, nh: usize, tw: usize, th: usize,
+        tfft: &[Vec<Complex<f32>>], planner: &mut FftPlanner<f32>,
+    ) -> (Decoded, f32, usize, usize) {
+        let rescaled = resample_y(suspect, nw, nh, tw, th);
+        let band = keep_embed_bands(&rescaled, tw, th);
+        let folded = fold_tile(&band, tw, th);
+
+        let mut ff: Vec<Complex<f32>> = folded.iter().map(|&v| Complex::new(v, 0.0)).collect();
+        fft_2d(&mut ff, FOLD, planner, false);
+
+        let mut score = vec![0.0f32; FOLD * FOLD];
+        let mut maps: Vec<Vec<f32>> = Vec::with_capacity(tfft.len());
+        let norm = (FOLD * FOLD) as f32;
+        for tf in tfft {
+            let mut prod: Vec<Complex<f32>> = ff.iter().zip(tf.iter()).map(|(a, b)| *a * b.conj()).collect();
+            fft_2d(&mut prod, FOLD, planner, true);
+            let c: Vec<f32> = prod.iter().map(|z| z.re / norm).collect();
+            for (s, v) in score.iter_mut().zip(c.iter()) { *s += v.abs(); }
+            maps.push(c);
+        }
+        let (mut bp, mut bv) = (0usize, f32::MIN);
+        for (i, &v) in score.iter().enumerate() { if v > bv { bv = v; bp = i; } }
+        let smed = { let mut s = score.clone(); s.sort_by(|a, b| a.partial_cmp(b).unwrap()); s[s.len() / 2].max(1e-6) };
+        let mut bits = [false; PAYLOAD_BITS];
+        for (b, m) in maps.iter().enumerate() { bits[b] = m[bp] > 0.0; }
+        (split_payload(&bits_to_payload(&bits)), bv / smed, bp % FOLD, bp / FOLD)
+    }
+
+    /// Progress events emitted during a blind decode, for an optional UI.  The
+    /// library stays print-free (and WASM-safe); the caller renders these however
+    /// it likes (a one-line bar, verbose log, or ignores them).
+    pub enum Progress {
+        Phase(&'static str),  // "building templates", "estimating scale"
+        Scale(f32),           // coarse scale estimate
+        Refine { step: usize, total: usize, scale: f32, prominence: f32, verified: bool },
+    }
+
+    /// Blindly recover scale + crop offset and decode the payload from a suspect Y
+    /// plane (cropped/rescaled, dimensions unknown).  No original image needed.
+    pub fn decode_blind_auto(y: &[f32], w: usize, h: usize) -> BlindResult {
+        decode_blind_auto_cb(y, w, h, &mut |_| {})
+    }
+
+    /// Like `decode_blind_auto` but reports `Progress` events to `progress`.
+    pub fn decode_blind_auto_cb(
+        y: &[f32], w: usize, h: usize, progress: &mut dyn FnMut(Progress),
+    ) -> BlindResult {
+        let mut planner = FftPlanner::<f32>::new();
+
+        // Precompute template FFTs once.
+        progress(Progress::Phase("building templates"));
+        let templates = bit_templates();
+        let tfft: Vec<Vec<Complex<f32>>> = templates.iter().map(|t| {
+            let mut f: Vec<Complex<f32>> = t.iter().map(|&v| Complex::new(v, 0.0)).collect();
+            fft_2d(&mut f, FOLD, &mut planner, false);
+            f
+        }).collect();
+
+        // Coarse scale from a centre block (1024 → ≥4 tile periods even at full scale).
+        progress(Progress::Phase("estimating scale"));
+        let sb = SCALE_BLOCK.min(w).min(h);
+        let blk = extract(y, w, (w - sb) / 2, (h - sb) / 2, sb);
+        let s0 = blind_scale(&blk, sb, &mut planner);
+        progress(Progress::Scale(s0));
+
+        // Refine: nudge scale ±, pick the strongest phase peak; that decode is the result.
+        let total = (2 * REFINE_STEPS + 1) as usize;
+        let mut best = (Decoded { data: [0u8; DATA_BYTES], verified: false }, f32::MIN, (0usize, 0usize), s0);
+        for (idx, k) in (-REFINE_STEPS..=REFINE_STEPS).enumerate() {
+            let s = s0 * (1.0 + REFINE_FRAC * k as f32);
+            let inv = 1.0 / s;
+            let tw = ((w as f32 * inv).round() as usize).max(2 * FOLD);
+            let th = ((h as f32 * inv).round() as usize).max(2 * FOLD);
+            let (dec, prom, ox, oy) = register_decode(y, w, h, tw, th, &tfft, &mut planner);
+            progress(Progress::Refine { step: idx + 1, total, scale: s, prominence: prom, verified: dec.verified });
+            // Prefer a CRC-verified candidate; otherwise the strongest phase peak.
+            let better = (dec.verified && !best.0.verified) || (dec.verified == best.0.verified && prom > best.1);
+            if better { best = (dec, prom, (ox, oy), s); }
+        }
+        BlindResult { data: best.0.data, verified: best.0.verified, scale: best.3, offset: best.2, confidence: best.1 }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -995,18 +1286,16 @@ mod tests {
         // Size-informed decode: the original (embed) dimensions are known.
         let (recovered, score) = decode_y_at_size_verbose(&scaled_y, sw, sh, w, h);
 
-        let errors: usize = PHASE3_PAYLOAD.iter().zip(recovered.iter())
-            .map(|(&a, &b)| (a ^ b).count_ones() as usize)
-            .sum();
+        let errors = crop_errs(&recovered.data);
 
         println!(
-            "resize {}/{}  {}×{} → {}×{} → regrid {}×{}  errors={}/{}  score={:.1}  (alpha={})",
+            "resize {}/{}  {}×{} → {}×{} → regrid {}×{}  errors={}/{}  score={:.1}  crc={}  (alpha={})",
             scale_num, scale_den,
             w, h, sw, sh, w, h,
-            errors, PAYLOAD_BITS, score, ALPHA,
+            errors, DATA_BYTES * 8, score, recovered.verified, ALPHA,
         );
 
-        (errors, recovered)
+        (errors, recovered.data)
     }
 
     // All cases below decode via `decode_y_at_size` — the suspect is resampled
@@ -1198,12 +1487,12 @@ mod tests {
                 label,
                 format!("{},{},{},{}", l, t, r, b),
                 format!("{}×{}", cw, ch),
-                crop_errs(&pa), sa,
-                crop_errs(&pb), sb,
-                crop_errs(&pc), sc,
+                crop_errs(&pa.data), sa,
+                crop_errs(&pb.data), sb,
+                crop_errs(&pc.data), sc,
             ));
             println!("{:<15} A={:>3}/{:>3.0}  B={:>3}/{:>3.0}  C={:>3}/{:>3.0}",
-                label, crop_errs(&pa), sa, crop_errs(&pb), sb, crop_errs(&pc), sc);
+                label, crop_errs(&pa.data), sa, crop_errs(&pb.data), sb, crop_errs(&pc.data), sc);
         }
 
         let report = format!(
@@ -1722,7 +2011,7 @@ Heatmaps (spectral-whitened autocorr): `autocorr_b512_s100.png` (1.0×), `_s50.p
         let smed = { let mut s = score.clone(); s.sort_by(|a, b| a.partial_cmp(b).unwrap()); s[s.len()/2].max(1e-6) };
         let mut bits = [false; PAYLOAD_BITS];
         for (b, m) in maps.iter().enumerate() { bits[b] = m[bp] > 0.0; }
-        (crop_errs(&bits_to_payload(&bits)), bv / smed, bp % FOLD, bp / FOLD)
+        (crop_errs(&split_payload(&bits_to_payload(&bits)).data), bv / smed, bp % FOLD, bp / FOLD)
     }
 
     #[test]
@@ -1816,5 +2105,106 @@ _offset φ is the recovered (x,y) mod {fold} at known scale; phase prom = peak/m
             out[ry * cw..ry * cw + cw].copy_from_slice(&src[s..s + cw]);
         }
         out
+    }
+
+    // ── Step 2: blind `--auto` sweep across all image fixtures ─────────────────
+    //
+    // For every `tests/*.jpg`, embed → (optionally JPEG) → crop → rescale, then run
+    // the *fully blind* `decode_blind_auto` (recover scale + offset, decode) and
+    // record raw (pre-ECC) bit errors + confidence.  Measures the real envelope
+    // across varied content (clean vs busy) and sizes the ECC.  Requires the
+    // `registration` feature:
+    //   cargo test -p glimr --features registration blind_auto_sweep -- --ignored --nocapture
+    #[cfg(feature = "registration")]
+    #[test]
+    #[ignore]
+    fn blind_auto_sweep() {
+        use image::{codecs::jpeg::JpegEncoder, ExtendedColorType, ImageEncoder};
+
+        let tests_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("tests");
+        let reports = reports_dir();
+
+        let mut fixtures: Vec<std::path::PathBuf> = std::fs::read_dir(&tests_dir).unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|x| x == "jpg" || x == "jpeg").unwrap_or(false))
+            .collect();
+        fixtures.sort();
+
+        let scales  = [1.0f32, 0.5];
+        let offsets = [("none", 0usize, 0usize), ("crop 130,200", 130, 200)];
+        let jpegs   = [("raw", false), ("q80", true)];
+
+        let mut rows = String::new();
+        let (mut clean, mut total, mut verified) = (0usize, 0usize, 0usize);
+
+        for path in &fixtures {
+            let img = image::open(path).unwrap().into_rgb8();
+            let (ow, oh) = (img.width() as usize, img.height() as usize);
+            let pixels = img.into_raw();
+            let orig_y = extract_y_rgb(&pixels);
+
+            let mut wm_y = orig_y.clone();
+            embed_y_masked(&mut wm_y, ow, oh, &PHASE3_PAYLOAD, MASK_STRENGTH);
+
+            // Watermarked-then-JPEG'd Y (realistic compressed channel).
+            let wm_jpeg_y = {
+                let mut pw = pixels.clone();
+                write_y_delta_rgb(&mut pw, &orig_y, &wm_y);
+                let mut jpg = Vec::new();
+                JpegEncoder::new_with_quality(&mut jpg, 80)
+                    .write_image(&pw, ow as u32, oh as u32, ExtendedColorType::Rgb8).unwrap();
+                let dec = image::load_from_memory(&jpg).unwrap().into_rgb8();
+                extract_y_rgb(dec.as_raw())
+            };
+
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            for &(jlabel, jpeg) in &jpegs {
+                let base = if jpeg { &wm_jpeg_y } else { &wm_y };
+                for &s in &scales {
+                    for &(olabel, ox, oy) in &offsets {
+                        let (cw, ch) = (ow - ox, oh - oy);
+                        let cropped = crop_rgb_y(base, ow, ox, oy, cw, ch);
+                        let (nw, nh) = ((cw as f32 * s).round() as usize, (ch as f32 * s).round() as usize);
+                        let suspect = resample_y(&cropped, cw, ch, nw, nh);
+
+                        let r = registration::decode_blind_auto(&suspect, nw, nh);
+                        let errs = crop_errs(&r.data);
+                        let serr = (r.scale / s - 1.0) * 100.0;
+                        total += 1;
+                        if errs == 0 { clean += 1; }
+                        if r.verified { verified += 1; }
+                        rows.push_str(&format!(
+                            "| {:<13} | {:<3} | {:>4.2} | {:<12} | {:>+6.1}% | {:>6.1} | {:>3}/128 | {:^3} |\n",
+                            name, jlabel, s, olabel, serr, r.confidence, errs, if r.verified { "✓" } else { "·" }));
+                        println!("{name} {jlabel} s={s:.2} {olabel}: scale_err={serr:+.1}% conf={:.1} errs={errs} crc={}", r.confidence, r.verified);
+                    }
+                }
+            }
+        }
+
+        let report = format!(
+"# Blind `--auto` sweep — multi-image, pre-ECC
+
+Embed (CDF 5/3, ALPHA={alpha}, levels {levels:?}, mask {mask}) → optional JPEG q80 → crop →
+rescale, then **fully blind** `decode_blind_auto` (recover scale + crop offset, decode).
+Raw bit errors are pre-ECC; `confidence` is the phase-peak prominence.  This measures the
+real envelope across varied content and sizes the ECC budget.
+
+Fixtures: {fixtures} images via `tests/*.jpg`.  **Clean (0-error) cells: {clean}/{total}; CRC-verified: {verified}/{total}.**
+
+Regenerate: `cargo test -p glimr --features registration blind_auto_sweep -- --ignored --nocapture`
+
+| image         | jpg | scale | crop         | scale err | confidence | bit errors | crc |
+|---------------|-----|-------|--------------|-----------|------------|------------|-----|
+{rows}
+_`crc` ✓ = the embedded CRC-32 verified (definitive). Cells with a few errors are ECC's job;\
+ cells near 64/128 are registration failures (need more signal)._
+",
+            alpha = ALPHA, levels = EMBED_LEVELS, mask = MASK_STRENGTH,
+            fixtures = fixtures.len(), clean = clean, total = total, verified = verified, rows = rows,
+        );
+        let path = reports.join("blind_auto_sweep.md");
+        std::fs::write(&path, report).unwrap();
+        println!("blind --auto sweep → {}  ({clean}/{total} clean, {verified}/{total} crc-verified)", path.display());
     }
 }

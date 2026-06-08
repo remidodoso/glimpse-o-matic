@@ -190,17 +190,20 @@ fn cli_decodes_resized_suspect_with_size_flag() {
 
     assert!(out.status.success(), "binary exited non-zero:\n{}", stdout);
     assert!(stdout.contains("deadbeef"), "fp not recovered from resized suspect:\n{}", stdout);
-    assert!(stdout.contains("detected"), "detection verdict missing:\n{}", stdout);
+    assert!(stdout.contains("version   : 1"), "version field wrong:\n{}", stdout);
+    assert!(!stdout.contains("not detected"), "verdict says not detected:\n{}", stdout);
 
     std::fs::remove_file(&tmp).ok();
 }
 
 #[test]
-fn cli_scan_recovers_unknown_size() {
-    use image::{codecs::jpeg::JpegEncoder, imageops, ExtendedColorType, ImageEncoder};
+fn cli_auto_default_decodes() {
+    use image::{codecs::jpeg::JpegEncoder, ExtendedColorType, ImageEncoder};
 
-    // Embed at native (2500), downscale to 70% — original dims "unknown" to the
-    // decoder — then let --scan find them by brute force over a narrow range.
+    // Default (no flags) = fully-blind --auto.  On a native-resolution watermarked
+    // JPEG it takes the fast path (one matched decode) and CRC-verifies.  (Blind
+    // recovery on cropped/rescaled inputs is measured by the lib `blind_auto_sweep`;
+    // end-to-end rescale via the binary is covered by the --size test above.)
     let img = image::open(test_image_path()).unwrap().into_rgb8();
     let (w, h) = (img.width() as usize, img.height() as usize);
     let pixels = img.into_raw();
@@ -218,15 +221,11 @@ fn cli_scan_recovers_unknown_size() {
     let mut pixels_wm = pixels.clone();
     write_y_delta_rgb(&mut pixels_wm, &orig_y, &y);
 
-    let wm_img = image::RgbImage::from_raw(w as u32, h as u32, pixels_wm).unwrap();
-    let (nw, nh) = ((w * 7 / 10) as u32, (h * 7 / 10) as u32);
-    let scaled = imageops::resize(&wm_img, nw, nh, imageops::FilterType::Lanczos3);
-
     let mut jpeg = Vec::new();
-    JpegEncoder::new_with_quality(&mut jpeg, 85)
-        .write_image(scaled.as_raw(), nw, nh, ExtendedColorType::Rgb8)
+    JpegEncoder::new_with_quality(&mut jpeg, 90)
+        .write_image(&pixels_wm, w as u32, h as u32, ExtendedColorType::Rgb8)
         .unwrap();
-    let tmp = std::env::temp_dir().join("wm_decode_scan_test.jpg");
+    let tmp = std::env::temp_dir().join("wm_decode_auto_test.jpg");
     std::fs::write(&tmp, &jpeg).unwrap();
 
     let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -239,20 +238,13 @@ fn cli_scan_recovers_unknown_size() {
         return;
     }
 
-    // Narrow range around the true 2500 to keep the test fast; step is 1px.
-    let out = Command::new(&bin)
-        .arg("--scan").arg("2490:2510")
-        .arg("--threads").arg("4")
-        .arg(&tmp)
-        .output().expect("failed to run binary");
+    let out = Command::new(&bin).arg(&tmp).output().expect("failed to run binary");
     let stdout = String::from_utf8_lossy(&out.stdout);
 
     assert!(out.status.success(), "binary exited non-zero:\n{}", stdout);
-    assert!(stdout.contains("deadbeef"), "fp not recovered by scan:\n{}", stdout);
-    assert!(stdout.contains("best fit  : 2500×2500"),
-        "scan did not land on 2500×2500:\n{}", stdout);
+    assert!(stdout.contains("deadbeef"), "fp not recovered by --auto:\n{}", stdout);
     assert!(stdout.contains("version   : 1"), "payload version wrong:\n{}", stdout);
-    assert!(!stdout.contains("not detected"), "scan reported no detection:\n{}", stdout);
+    assert!(stdout.contains("verified (CRC ok)"), "default decode not CRC-verified:\n{}", stdout);
 
     std::fs::remove_file(&tmp).ok();
 }

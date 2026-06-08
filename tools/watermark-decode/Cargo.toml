@@ -4,10 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-glimr = { path = "../../glimr" }
+glimr = { path = "../../glimr", features = ["registration"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-rayon = "1"
-ctrlc = "3"
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

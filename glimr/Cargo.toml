@@ -10,10 +10,16 @@ crate-type = ["cdylib", "lib"]
 wasm-bindgen = "0.2"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 js-sys = "0.3"
+rustfft = { version = "6", optional = true }   # FFT for blind registration; native-only
+
+[features]
+# Blind scale/offset recovery + decode (pulls rustfft). Enabled by the native
+# `watermark-decode` tool; NOT enabled for the WASM build, so the .wasm stays FFT-free.
+registration = ["dep:rustfft"]
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-rustfft = "6"   # native test-only (FFT for registration/autocorrelation experiments)
+rustfft = "6"   # also dev-dep so the (ungated) experimental sweeps compile under `cargo test`
 
 [dependencies.web-sys]
 version = "0.3"

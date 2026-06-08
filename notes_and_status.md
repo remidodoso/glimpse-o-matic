@@ -58,7 +58,10 @@ Active (permission requested): geolocation
 
 - **packg** (implemented): takes a directory of `.jpg` files → XOR encodes → renames to `.dat` → zips. Flags: `-o`/`--output`, `-f`/`--force`. Prints summary to stdout, errors to stderr.
 - **deployg** (implemented): creates self-contained gallery folder or uploads directly to Cloudflare R2. See deployg section below.
-- **read-watermark** (planned): input suspected leaked image → scan for LSB magic number → extract session payload; also attempt frequency-domain extraction
+- **watermark-decode** (implemented): input suspected leaked image → blindly recovers the
+  frequency-domain (DWT) payload — scale + crop offset auto-recovered, CRC verdict. Default is
+  fully blind; `--size`/`--ref` fast overrides; `-v` verbose + live progress bar. See the
+  Watermarking checkpoint. (LSB magic-number scan still TODO once the LSB layer ships.)
 - Future: `gallery-config.toml` output from packg, read by WASM build step to bake constants
 
 ---
@@ -227,57 +230,84 @@ Detailed design + tuning rationale live in `watermarking.md`; measured data in
 
 **Algorithm (shipped; WASM-active via `receive_pixels` → `embed_y`):**
 - Spread-spectrum in **CDF 5/3 DWT** detail bands **LH2/HL2/LH3/HL3** (Y channel), with a
-  modulo-tiled 64² PN sequence per payload bit (128-bit payload).
+  modulo-tiled 64² PN sequence per payload bit.
 - **ALPHA 0.15**, **EMBED_LEVELS [2,3]**, **perceptual masking** (`MASK_STRENGTH 0.5`,
   mean-1 / energy-neutral). Imperceptibility much improved: PSNR ≈ 45.5 dB, smooth
   film-grain (CDF 5/3) rather than Haar "popcorn", hidden in texture by masking.
 - Tuning journey (all measured): Haar → **CDF 5/3**; levels [3,4] → **[2,3]**; ALPHA
   1.0 → 0.3 → **0.15**; **modulo** (not stretched/normalized) PN tiling; masking blend.
 
-**Decoding (`glimr` + `tools/watermark-decode`):**
+**Payload — 192-bit format (CRC shipped, ECC reserved):**
+- **192 bits = 128 data + 32 CRC-32 + 32 reserved (ECC, zero for now)**. The CRC-32 (IEEE,
+  reflected poly `0xEDB88320`) is appended **inside WASM** (`embed_y` calls `crc32` →
+  `full_payload`), so the JS/WASM boundary stays the same **16 data bytes** (`build_payload`
+  unchanged). `Decoded { data: [u8;16], verified: bool }` is the decode result type;
+  `split_payload` checks the CRC and sets `verified`.
+- **CRC is the definitive verdict** — it replaced the old prominence/version-byte heuristic.
+  Empirically a *perfect oracle*: across the 40-cell blind sweep, CRC-verified count ==
+  clean-decode count (zero false accept, zero false reject). The reserved 32 bits are sized
+  for the few-bit ECC to come.
+
+**Decoding — blind is now the default (`glimr` + `tools/watermark-decode`):**
 - The critically-sampled DWT is **shift-variant** → recovery needs the *exact* original
-  pixel grid. `decode_y_at_size` resamples the suspect back to the original dimensions →
-  matched decode → handles **arbitrary scale given the original dimensions**.
-- CLI modes: `--size WxH` / `--ref <orig>` (known dims), **`--scan [MIN:MAX]`** (brute-force
-  size; `rayon`-threaded `--threads`, Ctrl-C-safe partial results, σ-confidence + top-N),
-  and blind `decode_y` (assumes native resolution).
-- Confidence = score vs the scan's own noise floor (σ above median) + a structural
-  `version`-byte self-check.
+  pixel grid. `decode_y_at_size` resamples the suspect back to original dims → matched decode.
+- **`decode_blind_auto` (shipped, feature-gated `registration`):** fully blind — spectral-
+  whitened autocorrelation recovers **scale** (`SCALE_BLOCK 1024` excerpt → 4 PN periods),
+  then folds the suspect into one tile (`FOLD 512`, LCM of the L2/L3 periods) and runs a keyed
+  per-bit cross-correlation for **offset + payload signs**, with a ±2% scale refinement ladder
+  (`REFINE_STEPS 2`, `REFINE_FRAC 0.005`). CRC gates the result. So a **cropped and/or rescaled**
+  suspect decodes with no side information.
+- **CLI (`tools/watermark-decode`) — simplified this cycle:**
+  - **Blind auto is the default** ("the way it just works"); no flag needed. A **CRC fast-path**
+    tries a native matched decode first and returns instantly if it verifies.
+  - `--size WxH` / `--ref <orig>` remain as mutually-exclusive fast overrides when dims are known.
+  - `--scan` (brute-force size; rayon/ctrlc) **removed** — strictly inferior to blind auto.
+    `--auto` kept as an accepted no-op alias for muscle memory.
+  - **`-v`/`--verbose`** narrates the search (templates → scale → per-rung scale/prominence/CRC);
+    otherwise a **live one-line progress bar** renders on an interactive TTY (`IsTerminal`-gated,
+    on stderr, erased before the result) and is suppressed when redirected. Lib stays UI-agnostic /
+    WASM-safe via a `Progress` callback (`decode_blind_auto_cb`); results print to stdout.
+  - Verdict bands: `verified (CRC ok)` / `likely — CRC failed` (confidence ≥ 3) / `not detected`.
 
-**Robustness (measured — see `tests/reports/`):**
-- JPEG q70–90: **0 errors**. Resize 50–120% (size known/scanned): **0 errors**; 33% marginal.
-- Crop (`crop_tolerance.md`): ~0 tolerance via resample today, **but the signal survives** —
-  pad-at-known-offset decodes 0 errors up to a 10% edge crop. So crop is a **registration**
-  problem (recover the offset), not signal loss.
-
-**Blind registration research (experimental — NOT shipped):**
-- **Stage 1** (`registration_stage1.md`): blind **scale** recovery from a **512×512** excerpt
-  via spectral-whitened autocorrelation — exact period (0% err), prominence 16–88; masking
-  does not hurt. (256² needs ≤0.5×.)
-- **Stage 2** (`registration_stage2.md`): blind **scale + offset + decode** proof-of-concept.
-  Scale exact (≤0.6%), crop offset recovered correctly, decode **0 errors on easy/medium
-  cells** (folding the *whole* image, ~95 tiles). Two limits, both predicted: marginal
-  per-bit SNR (phase prominence 2–12) and scale-precision drift at heavy downscale. Levers:
-  add level-3, **ECC**, scale refinement, sub-region decode. Small-sample-only decode (e.g.
-  512 alone, ~4 tiles) is **not** yet viable — fold SNR ∝ √(tile count).
+**Robustness (measured + real-world):**
+- JPEG q70–90: **0 errors**. Resize 50–120% (size known): **0 errors**.
+- Crop is a **registration** problem, not signal loss (`crop_tolerance.md`): pad-at-known-offset
+  decodes 0 errors to a 10% edge crop; blind auto now recovers the offset itself.
+- **Blind sweep (`blind_auto_sweep.md`): 36/40 cells clean & CRC-verified** after the
+  scale-window fix (512→1024 block recovered 10 of 12 full-scale failures). Remaining 4 misses:
+  2 are 1-bit ECC targets (test_a 0.50× + crop), 2 are hard-scale (test_e q80 1.0×).
+- **Real-world: every screenshot capture CRC-verified blind** — downscale (to 0.42×), crop,
+  partial occlusion (gray bar), JPEG recompression; consistent browser fp `6effd55f`.
+- **`sstest7` — first wild few-bit failure (ECC poster child):** significant crop at a
+  different scale, saved JPEG. Registration **locked** (refine 3/5 prominence 3.7 vs ~1.6
+  floor, scale 0.953); fp `6effd55f` + version + a coherent timestamp decoded correctly, but
+  a stray `0x80` high bit in the IP (≈1 bit-flip) → CRC correctly **refused** to certify
+  (`likely — CRC failed, confidence 3.7`). Exactly the regime ECC is sized to rescue.
 
 **Infrastructure this cycle:**
+- **Feature-gated registration**: `rustfft` is an *optional* dep behind the `registration`
+  feature; the **WASM build (no feature) stays FFT-free**; `watermark-decode` enables it.
 - **Memory**: `pixel_cache` capped at **250 MB** (`enforce_cache_budget`, farthest-from-current eviction).
 - **Download**: exports the **watermarked** image as JPEG (q0.92, `watermarked_pixels`);
   `raw_bytes` removed — closed the one-click un-watermarked-original leak.
 - **Test tiers**: fast correctness + robustness regression (assert) run always;
   **characterization sweeps** are `#[ignore]` and write `tests/reports/*.md` (`crop_tolerance`,
-  `registration_stage1`, `registration_stage2`). `rustfft` dev-dep; `embed_y_masked(strength)`
-  exposes the masking knob for experiments.
-- **`tests/reports/`**: `.md` tracked as living docs, heatmap PNGs gitignored. `.gitignore`
-  cleaned (untracked generated PNGs / `glimr/pkg` / workspace file; force-tracked the
-  `tests/test_a.jpg` fixture that `*.jpg` was wrongly excluding).
+  `registration_stage1/2`, `blind_auto_sweep`). `embed_y_masked(strength)` exposes the masking knob.
+- **`tests/reports/`**: `.md` tracked as living docs, heatmap PNGs gitignored. `tests/test_a.jpg`
+  force-tracked past the `*.jpg` ignore.
 
-**Next:**
-- **ECC / checksum** (queued) — strengthens normal decode, registration margin, and turns the
-  confidence check into a rigorous "verified" verdict.
-- Then Stage 2 robustness (level-3 + scale refinement) → wire a blind **`--auto`** decode mode
-  that supersedes `--scan`/`--size` and adds crop tolerance.
+**Next — ECC (queued, design agreed):**
+- Pipeline: receive 192 hard bits → **BCH-correct** → split 160 → CRC32 over the 128 data bits →
+  certify. CRC stays the final oracle (ECC proposes, CRC disposes → no false-certification risk).
+- **v1: shortened BCH(192, 160) over GF(2⁸), t = 4** (32 parity bits = the reserved field; t=4 is
+  the ceiling for 32 parity at m=8). Corrects ≤4 scattered bit-flips anywhere in the codeword —
+  covers the marginal band (the 1-bit sweep cells, `sstest7`). >4-error cases stay uncorrectable
+  but are sliding toward registration-failure anyway, and CRC still rejects them.
+- **Follow-ons (not v1):** (a) **soft-decision / CRC-aided retry** — we already compute per-bit
+  correlation *magnitudes* but keep only signs; flipping the least-confident bits + CRC-checking
+  corrects beyond hard t=4 cheaply. (b) **ECC-in-the-loop scale ladder** — accept the first refine
+  rung that CRC-verifies *after* correction (sstest7's rung 3 would likely pass).
+- Consider keeping `sstest7` as the first real-world few-bit regression fixture.
 
 ---
 
@@ -572,6 +602,14 @@ The ±1 pre-watermarking works well — scrolling to a neighbour is usually dela
 - `?zip=` URL param to select archive
 - Animate zoom transitions (smooth zoom on wheel/pinch/keyboard)
 - `gallery-config.toml` output from packg; WASM build bakes constants
+- **Per-gallery XOR key (bespoke app instances).** packg/deployg optionally generate a
+  *random* XOR key (instead of the shared compiled-in `0xDEADBEEF`) used to obfuscate that
+  zip's `.dat` images; bake the key into *that gallery's* WASM build (hard to extract from
+  the binary) so each deployed gallery is a bespoke app instance matched to its own zip —
+  extracting/decoding one gallery's images doesn't help with another. Fits the
+  `gallery-config.toml` → WASM-build-bakes-constants flow above; raises the obfuscation bar
+  from "one shared key" to "per-gallery key" while staying "moderate inconvenience" (still
+  recoverable by a determined reverser of that gallery's WASM).
 - `read-watermark` tool
 - LSB watermarking implementation in WASM
 - Frequency-domain watermarking implementation in WASM
