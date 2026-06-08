@@ -1,6 +1,8 @@
 # Phase 5c — scale-precision cliff (matched decode)
 
-A cleanly-embedded test_a decoded at deliberately *wrong* target sizes (±3% in 0.25%
+_Generated 2026-06-08 20:01:47 UTC · glimr 0.1.0 · commit `bf06e80-dirty` · config ALPHA=0.15, levels=[2, 3], mask=0.5, ECC=BCH(192,160) t=4._
+
+A cleanly-embedded canonical fixture decoded at deliberately *wrong* target sizes (±3% in 0.25%
 steps).  `raw` = pre-ECC codeword errors; `score` = alignment L1 (the candidate soft
 metric).  Shows how sharp the registration cliff is and whether `score` tracks the
 error count monotonically — i.e. is it a usable objective for fine-scale hill-climbing.

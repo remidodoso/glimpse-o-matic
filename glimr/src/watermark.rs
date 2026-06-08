@@ -1857,6 +1857,41 @@ mod tests {
         d
     }
 
+    // Gregorian UTC breakdown of a unix timestamp (Howard Hinnant's algorithm).
+    fn unix_to_utc(ts: u64) -> (i64, u32, u32, u32, u32, u32) {
+        let (days, rem) = ((ts / 86400) as i64, ts % 86400);
+        let (h, mi, s) = ((rem / 3600) as u32, ((rem / 60) % 60) as u32, (rem % 60) as u32);
+        let z = days + 719468;
+        let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+        let doe = z - era * 146097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+        (y, m as u32, d, h, mi, s)
+    }
+
+    // One-line provenance stamp for generated reports: run time (UTC) + crate version
+    // + git short-rev (with a `-dirty` flag for an uncommitted tree) + the config the
+    // run used.  Lets a committed report say exactly when/what it was generated from.
+    fn report_stamp() -> String {
+        let git = |args: &[&str]| std::process::Command::new("git").args(args).output().ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+        let mut rev = git(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());
+        if git(&["status", "--porcelain"]).map(|s| !s.is_empty()).unwrap_or(false) {
+            rev.push_str("-dirty");
+        }
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs()).unwrap_or(0);
+        let (y, mo, d, h, mi, s) = unix_to_utc(ts);
+        format!("_Generated {y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC · glimr {ver} · commit `{rev}` · \
+config ALPHA={a}, levels={lv:?}, mask={mk}, ECC=BCH(192,160) t={t}._",
+            ver = env!("CARGO_PKG_VERSION"), a = ALPHA, lv = EMBED_LEVELS, mk = MASK_STRENGTH, t = bch::T)
+    }
+
     // The default fixture for single-image tests: the first entry tagged `canonical`
     // in fixtures/captions.yaml, else the first entry, else the first `.jpg`.
     fn canonical_fixture() -> std::path::PathBuf {
@@ -1978,8 +2013,11 @@ mod tests {
                 label, crop_errs(&pa.data), sa, crop_errs(&pb.data), sb, crop_errs(&pc.data), sc);
         }
 
+        let stamp = report_stamp();
         let report = format!(
 "# Crop tolerance — characterization
+
+{stamp}
 
 Source: `tests/fixtures/quyen.jpg` ({ow}×{oh}).  Wavelet: CDF 5/3.  ALPHA={alpha}, levels {levels:?}.
 Payload: `DEADBEEF CAFEBABE 01234567 89ABCDEF` (test pattern, so `version` reads invalid — \
@@ -2097,13 +2135,16 @@ _Lower errors / higher score = better. 0 errors = exact recovery._
             }
         }
 
+        let stamp = report_stamp();
         let report = format!(
-"# Blind `--auto` sweep — multi-image, pre-ECC
+"# Blind `--auto` sweep — multi-image robustness
+
+{stamp}
 
 Embed (CDF 5/3, ALPHA={alpha}, levels {levels:?}, mask {mask}) → optional JPEG q80 → crop →
-rescale, then **fully blind** `decode_blind_auto` (recover scale + crop offset, decode).
-Raw bit errors are pre-ECC; `confidence` is the phase-peak prominence.  This measures the
-real envelope across varied content and sizes the ECC budget.
+rescale, then **fully blind** `decode_blind_auto` (recover scale + crop offset, decode —
+including ECC).  `errs` are residual bit errors *after* ECC, `crc` ✓ is the definitive verdict,
+`confidence` is the phase-peak prominence.  Measures the real end-to-end envelope across content.
 
 Fixtures: {fixtures} images via `tests/fixtures/*.jpg`.  **Clean (0-error) cells: {clean}/{total}; CRC-verified: {verified}/{total}.**
 
@@ -2190,8 +2231,11 @@ _`crc` ✓ = the embedded CRC-32 verified (definitive). Cells with a few errors 
                 }
             }
         }
+        let stamp = report_stamp();
         let report = format!(
 "# Phase 5a — channel-quality waterfall (matched decode)
+
+{stamp}
 
 Embed → scale → JPEG q → **decode at the known original size** (registration exact, so
 the only error source is channel noise).  `raw` = pre-ECC bit errors over the 192-bit
@@ -2242,8 +2286,11 @@ _If `raw` steps 0→1→2→3→4 before climbing, t=4 buys real range; if it ju
                 dfrac * 100.0, format!("{}×{}", tw, th), raw, score, if d.verified { "✓" } else { "·" }));
             println!("scale {:+.2}%: raw_errs={raw} score={score:.1} crc={}", dfrac * 100.0, d.verified);
         }
+        let stamp = report_stamp();
         let report = format!(
 "# Phase 5c — scale-precision cliff (matched decode)
+
+{stamp}
 
 A cleanly-embedded canonical fixture decoded at deliberately *wrong* target sizes (±3% in 0.25%
 steps).  `raw` = pre-ECC codeword errors; `score` = alignment L1 (the candidate soft
@@ -2318,8 +2365,11 @@ _A narrow 0-error notch with `score` peaking there and falling off monotonically
                     blind.scale, blind.verified, matched.verified, top.0, expected_lag, true_rank);
             }
         }
+        let stamp = report_stamp();
         let report = format!(
 "# Phase 5b — blind-sync mechanism (white-seamless vs detail-rich)
+
+{stamp}
 
 At the q80 scales, for detail-rich quyen and white-seamless riley: recovered **blind
 scale**, whether **matched `--size`** decode still verifies (signal survived ⇒ a sync

@@ -507,6 +507,64 @@ renorm. **Measured result was a net negative:**
 
 ---
 
+## Test & Demonstration Apparatus (2026-06-08)
+
+Reorganized the test suite around a committed, **browsable demonstration** model (with only a few
+acceptance gates).  **Layout:**
+- **`tests/fixtures/`** — committed, read-only source photos (all owned/PD) + **`captions.yaml`**
+  (`caption` + `tags` per image; the `canonical` tag picks the default single-image fixture).
+  Resolved at test time by `canonical_fixture()` (reads the YAML; `serde_yaml` dev-dep). Current set:
+  collibrina, fairbanks, **quyen** (canonical), **riley** (white-seamless), zia.
+- **`tests/reports/`** — generated reports (`.md` today; `.html` planned). **`tests/reports/output/`** —
+  generated artifacts (images, logs) the reports reference. **Never write into `fixtures/`** (read-only).
+- **`tests/local-only/`** — gitignored scratch for ad-hoc "just experimenting" runs.
+- **`tests/failed_crops/`** — gitignored real-capture inputs (private; demos skip if absent).
+- **Commit everything** (fixtures, reports, output images) so the repo browses as a showcase. Safe
+  because generation is **deterministic** (fixed PN key + payload, deterministic encode) → regenerating
+  unchanged code is a git no-op; history only grows on real changes.
+- **`.gitignore`:** `*.jpg` ignored except `!tests/fixtures/*.jpg`; reports + output committed;
+  `tests/local-only/` ignored.
+
+**Done this cycle:**
+- **Report stamping** — every report carries `report_stamp()`: run timestamp (UTC), crate version, git
+  short-rev (+`-dirty` for an uncommitted tree), and the config (ALPHA/levels/mask/ECC t). A committed
+  report states exactly when/what it was generated from.
+- **Cleanup** — retired four superfluous reports+tests: `registration_stage1/2` (obsolete
+  pre-productization feasibility studies, superseded by `decode_blind_auto` + `blind_auto_sweep`) and
+  `brute_scale_failed_crops` + `scale_peak_ranks` (spent diagnostics on gitignored inputs; conclusions
+  baked into the shipped harmonic-sibling fix), plus their exclusive DSP helpers and the now-unused
+  registration `scale_sweep`/`scale_peaks_multi`.
+- **Surviving reports (re-run fresh, stamped):** **blind_auto_sweep** (robustness matrix, 40/40),
+  **channel_waterfall** (JPEG waterfall + ECC band), **scale_precision** (registration cliff),
+  **sync_mechanism** (white-seamless sync). Plus `crop_tolerance`/`emit_visual_samples` demos (no
+  committed report yet).
+- **WebP** decode in `watermark-decode` (`image` `webp` feature, pure-Rust); integration-tested
+  (incl. a real Bluesky-laundered WebP capture decoding).
+
+### Planned — reports → public "journals" (.md + .html)
+
+Goal: a scrollable, image-rich document a reader browses to *see the system in action*, annotated with
+results. Decisions settled:
+- **Two formats from one run.** `.md` = GitHub-browsable (renders inline on the repo page); `.html` =
+  the deluxe standalone showcase — the only one that supports a real **click→CSS-overlay lightbox** +
+  `loading="lazy"`. *Constraint:* GitHub sanitizes markdown HTML, so the lightbox works **only** in the
+  `.html`; in `.md`, link-wrapped shrunk images give click-opens-full via GitHub's own image viewer.
+  (GitHub also doesn't *render* committed `.html` — open locally or via Pages.)
+- **"Dumbnail" images:** full-res committed, **displayed shrunk** (~320 px via `<img width>`), click for
+  full — **no separate thumbnail files**, **no downscaling** (seeing actual full-res quality matters;
+  ~100–200 MB total is acceptable). Lazy-load keeps the long HTML page usable.
+- **Content:** imperceptibility triptychs (original | watermarked | residual + PSNR/max|Δ|), the
+  robustness matrix with **hand-drawn heatmaps** (colored cells — no plotting dependency), real-capture
+  panels (input + decode verdict), and the quality waterfall.
+- **Index:** a `tests/reports/README.md` — one line + headline metric per report.
+- **Tiering:** keep *few* fast acceptance gates, *most* as demonstrations. **Gap to close:** the blind
+  decode path has no fast acceptance gate (only the ~5-min `#[ignore]` sweep) — add one small asserting
+  blind crop/scale test so a regression fails `cargo test`.
+- **Generation:** demos stay in-module (they need private internals — examples/integration files only
+  see the public API); a runner (cargo alias / PS script) regenerates all reports + the index in one step.
+
+---
+
 ## Phase 2 — In-Progress Detail
 
 ### Step progress
