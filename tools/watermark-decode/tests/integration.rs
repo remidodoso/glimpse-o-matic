@@ -248,3 +248,50 @@ fn cli_auto_default_decodes() {
 
     std::fs::remove_file(&tmp).ok();
 }
+
+#[test]
+fn cli_decodes_watermarked_webp() {
+    // WebP support is just the `image` crate's `webp` feature (pure-Rust decode).
+    // Encode a watermarked image as lossless WebP and confirm the binary reads it.
+    let img = image::open(test_image_path()).unwrap().into_rgb8();
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    let pixels = img.into_raw();
+    let orig_y = watermark::extract_y_rgb(&pixels);
+
+    let payload: [u8; 16] = [
+        0x78, 0x56, 0x34, 0x12,
+        0x00, 0x00, 0x00, 0x00,
+        0xef, 0xbe, 0xad, 0xde,  // browser fp = 0xdeadbeef
+        0x00, 0x00, 0x00, 0x01,  // version = 1
+    ];
+
+    let mut y = orig_y.clone();
+    watermark::embed_y(&mut y, w, h, &payload);
+    let mut pixels_wm = pixels.clone();
+    write_y_delta_rgb(&mut pixels_wm, &orig_y, &y);
+
+    // Lossless WebP (the encoder image 0.25 provides); decode must read it.
+    let tmp = std::env::temp_dir().join("wm_decode_test.webp");
+    image::save_buffer(&tmp, &pixels_wm, w as u32, h as u32, image::ColorType::Rgb8)
+        .expect("lossless WebP encode");
+
+    let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent().unwrap()
+        .parent().unwrap()
+        .join("target").join("release").join("watermark-decode")
+        .with_extension(std::env::consts::EXE_EXTENSION);
+    if !bin.exists() {
+        eprintln!("release binary not built yet — skipping CLI test");
+        return;
+    }
+
+    let out = Command::new(&bin).arg(&tmp).output().expect("failed to run binary");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(out.status.success(), "binary exited non-zero on WebP:\n{}", stdout);
+    assert!(stdout.contains("deadbeef"), "fp not recovered from WebP:\n{}", stdout);
+    assert!(stdout.contains("version   : 1"), "payload version wrong:\n{}", stdout);
+    assert!(stdout.contains("verified (CRC ok)"), "WebP decode not CRC-verified:\n{}", stdout);
+
+    std::fs::remove_file(&tmp).ok();
+}

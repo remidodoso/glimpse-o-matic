@@ -477,6 +477,31 @@ renorm. **Measured result was a net negative:**
     40/40 held** (a transient single-best-refine simplification regressed test_d → fixed by refining the
     top-4 expanded candidates). Decode-only change → **WASM unaffected**; binary synced to `tools/bin`.
   - `--verbose` shows the harmonic path (`candidate 1/12: scale 1.012 ✗` → `2/12: scale 0.506 ✓ CRC`).
+- **Real-world end-to-end win (sstest20, 2026-06-08):** a 1.6 MP cropped screenshot decoded fully blind —
+  scale **1.121** (an *upscale*/zoom; note 1.121 was the *spurious* #1 peak on other crops, here genuine
+  and CRC-confirmed) + offset recovered, **ECC corrected 2 bit errors** → **verified (CRC ok)** (fp
+  `6effd55f`). The **first wild capture actually rescued *by ECC*** (sstest7, the original poster child,
+  couldn't be — it predated parity embedding). Validates the whole stack together: blind scale/offset +
+  harmonic candidates + BCH t=4 correction + CRC verdict.
+  - **sstest21 (0.93 MP crop): verified at prominence 2.7** (ECC fixed 2 bits, scale 0.602 at candidate
+    #1). Underscores that **CRC — not prominence — is the verdict**: 2.7 is well below any eyeball
+    threshold (floor ~1.6; CLI's tentative band is ≥3.0), yet CRC+ECC make it a *certain* decode. ECC+CRC
+    are now routinely extending the usable envelope into the low-prominence / few-bit-error regime they
+    were sized for.
+  - **Non-watermarked regions are rejected, not destructive** (sstest21 included ~10% flat viewer-chrome
+    gray and still decoded): the decode correlates against a **zero-mean ±1 PN**, so a constant (flat
+    gray) sums to ≈0 against it, and unrelated content is uncorrelated → averages out. Cost is only lost
+    signal *area* (~√(signal-fraction) SNR — 10% blank ≈ 5% amplitude), not corruption. This is why
+    viewer chrome / gray bars / partial occlusion are tolerated; the displacement is absorbed by offset
+    recovery.
+  - **Survived a social-media round-trip (multitest.webp, 2026-06-08) — the real threat model.** sstest21
+    re-uploaded to **Bluesky** (which transcodes to **lossy WebP**) and downloaded → still **verified
+    (CRC ok)**, same payload, prominence 2.4, **ECC fixed 3 bits** (vs 2 pre-Bluesky). Full lossy chain
+    survived: 3200 embed → browser downscale (0.602×) → screenshot crop (+gray border) → JPEG → Bluesky
+    WebP. Empirically resolves the "lossy-WebP robustness uncharacterized" caveat (real WebP preserved
+    the mark). **ECC budget is visible per generation:** each added lossy hop cost ~1 more correctable
+    bit (2→3), so t=4 has headroom for ~1–2 more before soft-decision / a stronger code would be needed.
+    (Also confirms WebP decode end-to-end on a real file, beyond the lossless test.)
 - **Phase 8 (conditional, low priority):** fine-scale CRC-gated refinement on the score objective —
   more justified now (cliff narrower than coarse resolution) but secondary to Phase 7.
 

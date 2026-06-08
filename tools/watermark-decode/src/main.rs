@@ -21,7 +21,7 @@ fn usage() -> ! {
     eprintln!("  --ref <original>  read original dimensions from a reference image file");
     eprintln!("  -v, --verbose     narrate the blind search (instead of the live progress bar)");
     eprintln!();
-    eprintln!("Formats: JPEG, PNG.  A live one-line progress bar shows during blind recovery");
+    eprintln!("Formats: JPEG, PNG, WebP.  A live one-line progress bar shows during blind recovery");
     eprintln!("on an interactive terminal (suppressed when stderr is redirected).");
     std::process::exit(1);
 }
