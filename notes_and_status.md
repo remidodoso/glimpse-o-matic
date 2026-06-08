@@ -311,6 +311,82 @@ Detailed design + tuning rationale live in `watermarking.md`; measured data in
 
 ---
 
+## Roadmap & Forward-Looking Design (2026-06-07)
+
+Design discussions captured but **not yet implemented**. **Near-term coding order:**
+**ECC** → revisit **performance** (measure first) → sand **UI rough edges** → maybe
+**location request** → **social preview** (wanted soon; see *Social Preview*). The
+Cloudflare / identity work below is staged **after static "feature complete."**
+
+### Payload format evolution (design principle — bake into the ECC work)
+
+The payload *will* change as the setup evolves (today self-contained ts/ip/fp/ref; later an
+`event_id` index + MAC once a server/DB exists). Write the codec and tools so that evolution is
+cheap. Two layers that change at different rates:
+
+- **Channel layer** — envelope size, integrity slot, ECC scheme, PN/bit count. **Frozen per generation.**
+- **Semantic layer** — what the data bits *mean*, dispatched by the `version` byte (already present).
+
+Rules:
+- **Freeze the channel, evolve the semantics.** Correct + integrity-check version-independently,
+  *then* read `version` and interpret the data field per that version's schema.
+- **Decoder tries an ordered list of known format generations, each self-checking** (own envelope +
+  ECC + integrity); first that verifies wins — mirrors the blind scale sweep. Buys channel-layer
+  evolution *and* perpetual backward-compat (old images keep decoding while their generation stays
+  in the list). Today: one generation.
+- **`embed_y` stays payload-agnostic** (opaque bytes in; appends integrity+ECC). All version logic
+  lives in *construction* (`build_payload`), which stamps the version it emits. When bytes later
+  come from a server, only the construction site changes.
+- **Decouple capacity from usage** — size the data field generously now, let unused bits be
+  reserved/zero; growing *usage* within a fixed envelope is a pure semantic change (new version), no
+  channel break. Only growing the *envelope* is a channel break (absorbed by the generation list).
+- **Tooling**: `print_fields` must become `match version { … _ => raw_dump }` — unknown/future
+  versions print raw bytes + "unknown version N", never mislabel.
+
+Introduce the generation/version structure *as part of* the ECC change (we're in the codec anyway).
+
+### Future: server-side identity (Cloudflare Workers + D1)
+
+Open to Workers + D1 (SQLite); expected to fit the free tier for a long time. Static hosting stays
+the backbone — this is additive, approached incrementally.
+
+- **Authoritative capture.** A Worker on the HTML entry point sees what the client can't fake:
+  `CF-Connecting-IP`, `request.cf` (country/city/region, coarse lat-long, timezone, ASN/ISP, colo,
+  TLS fingerprint, bot score), UA / Accept-Language / Referer. Obviates and beats the current
+  client-side IP self-report call.
+- **"SSI" = HTMLRewriter** (a Worker streaming transform), not classic includes — injects a
+  token / signed payload into the served HTML. Only the HTML entry point needs the Worker; assets
+  serve straight from R2.
+- **Payload = index + MAC (keep the full 128b, spend it efficiently).** Embed a compact `event_id`
+  (~32b) referencing a rich D1 row (user/ip/geo/fp/gallery/image/referrer/ts), optional coarse
+  self-describing bits (day + gallery) so a leaked image is partly legible without the DB, and a
+  **server-computed truncated MAC**:
+  - **MAC, not signature.** A real asymmetric signature (Ed25519 = 512b) won't fit; you don't need
+    public verifiability (you're the sole verifier), so a symmetric truncated MAC is the right tool —
+    cheap in bits. **Must be computed in the Worker** (key never in client WASM) or it's forgeable.
+    Verification is private → attacker has no offline oracle → even 32b is effectively unforgeable.
+    **Subsumes the CRC** (detects errors *and* tampering) → reclaim the CRC field for more ECC. It is
+    **not** legal non-repudiation (you hold the key) — it deters third-party forgery, which is the
+    stated goal.
+- **Access log + rolling.** Hot `events` table in D1 (one row per visit/download); a **Workers Cron
+  Trigger** rolls it up to per-user/day summaries and prunes raw rows; optional cold archive to R2 as
+  NDJSON. Rolling = built-in data minimization (coarsen/drop raw IP after the window). The identity
+  keyspace never rolls (returning users keep their id).
+- **Caveats**: fingerprint drift → **best-effort** identity (not 1:1 with humans); client-side embed
+  is tamperable → the **D1 row is the authoritative record**, the watermark is corroborating; the MAC
+  stops *forging* a new identity, not *replaying* a captured-valid blob (a non-threat, and logged).
+- **Granularity (decide later)**: page-load capture (who visited) vs a download-time beacon (who
+  downloaded which image, when).
+
+### Location request
+
+Precise geolocation needs a **permission prompt** = friction against the zero-friction ethos, and
+most viewers deny it; IP already yields coarse geo server-side later for free. Lean: a **DB-era
+field keyed by `event_id`**, or a deliberate/optional prompt if added in the static era — a
+semantic-layer/version change either way.
+
+---
+
 ## Phase 2 — In-Progress Detail
 
 ### Step progress
@@ -528,6 +604,60 @@ zone_id           = ...   ; Cloudflare zone ID for cache purge
 
 ---
 
+## Social Preview (Open Graph)
+
+Wanted soon. Goal: a shareable link card that, if "stolen," advertises the brand.
+
+**The governing fact: social crawlers don't run JS.** `facebookexternalhit`, `Twitterbot`,
+`Slackbot`, `Discordbot`, iMessage, LinkedIn, WhatsApp fetch raw HTML and read `<meta>` tags — they
+never execute `main.js`. So OG/Twitter tags must live in the **served HTML at request time** →
+**stamped at deploy time**, which fits the per-gallery `index.html` model (each gallery is its own
+prefix; deployg already writes that HTML and knows `domain`). The future `?zip=` URL-param idea
+would *break* static previews (one HTML, one card for all galleries) → that route would need the
+Worker/HTMLRewriter era.
+
+**Tags** (both families): `og:title/description/type/url/image` + `og:image:width/height`
+(**1200×630**, the large-card size) + `twitter:card=summary_large_image/title/description/image`.
+`og:image` **must be an absolute, public, standalone URL** (crawlers can't unzip; no data URLs; no
+relative paths) → the preview is a **separate small object** deployg uploads to the gallery prefix,
+not inside `Demo.zip`. Stamp **idempotently** — replace a delimited `<!-- og:start -->…<!-- og:end -->`
+block (like the existing Build stamp) so redeploys don't duplicate tags.
+
+**The preview image — a composited promo card.** Large thumbnail + the image-set name as a big text
+overlay + the `sip.png` logo. The overlay + low-res + logo *is* the protection — a stolen preview
+promotes the photographer (**security inversion**: re-publishing becomes desirable, not a leak).
+
+**Rendering: pure Rust, no headless browser, no ImageMagick.**
+- **Light path** — **`image`** (decode / resize→1200×630 / encode) + **`ab_glyph`** (or
+  `imageproc::draw_text_mut`) for text, **font embedded via `include_bytes!`** for deterministic
+  output, alpha-blend `sip.png`. Scrim = filled translucent rect; drop shadow = glyph drawn dark +
+  offset then light. Enough for title + logo + scrim.
+- **Flexible path** — **SVG template + `resvg`** (pure Rust: usvg + tiny-skia + fontdb): declarative
+  layout / gradients / multiline, tweak the look by editing the SVG vs recompiling. Heavier dep; pick
+  this if the card design will be iterated.
+- Adding `image` + `ab_glyph` to **deployg** is fine — native dev tool; the earlier `image`
+  reluctance was about *WASM* build time only.
+- **Reject**: headless browser (Chromium download, fragile CI) and ImageMagick (external binary,
+  platform-variable) — explicitly not wanted.
+
+**Mechanics.** Author supplies the **base photo** (`preview-src.jpg`) so deployg needn't crack the
+zip (XOR + inflate + decode a `.dat`). **Decouple render from upload**: a `deployg --make-preview`
+mode (or sibling tool) renders `preview.jpg` to disk from {base, title, logo} → preview-before-deploy
+loop; the OG step then uploads-and-stamps whatever `preview.jpg` exists. Title is one source of truth
+(overlay text = `og:title`). Latin titles → `ab_glyph` fine; accents/CJK → ensure font coverage or
+use `cosmic-text`.
+
+**Cache dependency.** Platforms cache OG aggressively and Cloudflare's edge serves stale HTML/image
+until purged → this is the **first feature that genuinely needs** the disabled
+`cloudflare::purge_cache` (Zone:Cache Purge token), plus a one-time re-scrape via each platform's
+debugger (Facebook Sharing Debugger, Twitter Card Validator, LinkedIn Post Inspector).
+
+**Open decisions:** render stack (light vs SVG); base source (author-supplied vs auto-derive); card
+spec (title placement, logo corner/size, embedded font); where it runs (`--make-preview` vs sibling);
+no-meta fallback (emit nothing vs neutral site-level tags).
+
+---
+
 ## Notes / Gotchas
 
 - **`client_width` vs `width`**: always use `client_width/height` for viewport size, then `set_width/height` to match.
@@ -614,6 +744,8 @@ The ±1 pre-watermarking works well — scrolling to a neighbour is usually dela
 - LSB watermarking implementation in WASM
 - Frequency-domain watermarking implementation in WASM
 - PWA manifest for iOS home-screen fullscreen
-- Social preview (Open Graph): `meta.json` in source dir → included in zip by packg; deployg extracts preview image, stamps `og:title`/`og:image` into `index.html`
+- **Social preview (Open Graph)** — wanted soon; see the *Social Preview* section. deployg stamps
+  per-gallery OG/Twitter tags at deploy time and renders a composited promo card (pure-Rust:
+  `image` + `ab_glyph`, or SVG + `resvg`); needs the Cloudflare cache-purge token to refresh.
 - Recursion option for packg (currently flat directory only)
 - `<glimr-player src="...">` Web Component (Phase 3–4)

@@ -13,19 +13,46 @@ pub const DECOMP_DEPTH:  u32   = 4;
 // Payload layout (192 embedded bits = 24 bytes):
 //   bytes  0..16  data       (the 128-bit message JS assembles)
 //   bytes 16..20  CRC-32 of the data (LE)  — verification
-//   bytes 20..24  reserved for ECC parity  — zero for now
-// `embed_y` takes the 16 data bytes; the CRC is computed in WASM (one Rust place,
-// shared with the decoder), so the JS boundary stays 16 bytes.
+//   bytes 20..24  BCH(192,160) t=4 parity over data+CRC  — error correction
+// `embed_y` takes the 16 data bytes; the CRC and ECC parity are computed in WASM
+// (one Rust place, shared with the decoder), so the JS boundary stays 16 bytes.
 pub const PAYLOAD_BITS:  usize = 192;  // total embedded bits
 pub const DATA_BYTES:    usize = 16;   // message bytes (128 data bits)
 pub const FULL_BYTES:    usize = 24;   // data + CRC + reserved-ECC
 pub const RESIDUAL_AMP:  f32   = 20.0;
 
-/// Decoded result: the 16 data bytes plus whether the embedded CRC matched.
+/// Channel-layer format **generation**.  The channel — envelope size, integrity
+/// slot, ECC scheme — is frozen per generation; only the *semantic* meaning of the
+/// data bytes evolves, dispatched by the payload `version` byte (handled by the
+/// consumer, e.g. the CLI's field printer).  Decoding is version-independent:
+/// correct + verify against a generation, *then* interpret the data.
+///
+/// There is one generation today (`GEN1`).  A future channel change — a larger
+/// envelope, CRC→MAC, or a different ECC — would add a second `Generation` that
+/// `decode_bits` tries in turn: the first whose integrity check verifies wins,
+/// which keeps images from older generations decodable indefinitely.
+#[derive(Clone, Copy, Debug)]
+pub struct Generation {
+    pub id:           u32,   // generation number (the channel format, not the payload version)
+    pub payload_bits: usize, // total embedded bits (the envelope)
+    pub data_bytes:   usize, // semantic message bytes
+    pub crc_bytes:    usize, // integrity field width (bytes)
+    pub ecc_t:        usize, // BCH error-correction capability (0 = none)
+}
+
+/// The current (and only) channel generation: 192-bit envelope = 128 data + 32
+/// CRC-32 + 32 BCH(192,160) parity, correcting up to 4 bit errors.
+pub const GEN1: Generation = Generation {
+    id: 1, payload_bits: PAYLOAD_BITS, data_bytes: DATA_BYTES, crc_bytes: 4, ecc_t: bch::T,
+};
+
+/// Decoded result: the 16 data bytes, whether the embedded CRC matched, and how
+/// many bit errors ECC fixed to get there (0 if clean, or if still unverified).
 #[derive(Clone, Copy, Debug)]
 pub struct Decoded {
     pub data:     [u8; DATA_BYTES],
     pub verified: bool, // CRC-32 over `data` matches the embedded checksum
+    pub errors_corrected: u8, // BCH bit-errors corrected before the CRC verified
 }
 
 /// CRC-32 (IEEE 802.3, reflected poly 0xEDB88320), bitwise — tiny payload, no table.
@@ -40,12 +67,21 @@ pub fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-/// Assemble the 24-byte embedded payload from the 16 data bytes: data ++ CRC32(data) ++ zeros(ECC).
+/// Assemble the 24-byte embedded payload: data ++ CRC32(data) ++ BCH parity.
 fn full_payload(data: &[u8; DATA_BYTES]) -> [u8; FULL_BYTES] {
     let mut full = [0u8; FULL_BYTES];
     full[..DATA_BYTES].copy_from_slice(data);
     full[DATA_BYTES..DATA_BYTES + 4].copy_from_slice(&crc32(data).to_le_bytes());
-    // bytes 20..24 left zero (reserved for ECC parity)
+
+    // ECC: BCH(192,160) parity over the 160 info bits (data ++ CRC), into bytes 20..24.
+    // The bit order matches `payload_to_bits` (LSB-first within each byte) so the
+    // embedded codeword is laid out [info(160) | parity(32)] — what the bch codec expects.
+    let mut info = [false; bch::INFO_BITS];
+    for (i, b) in info.iter_mut().enumerate() { *b = (full[i / 8] >> (i % 8)) & 1 == 1; }
+    let parity = bch::shared().encode_parity(&info);
+    for (i, &p) in parity.iter().enumerate() {
+        if p { full[DATA_BYTES + 4 + i / 8] |= 1 << (i % 8); }
+    }
     full
 }
 
@@ -54,7 +90,209 @@ fn split_payload(full: &[u8; FULL_BYTES]) -> Decoded {
     let mut data = [0u8; DATA_BYTES];
     data.copy_from_slice(&full[..DATA_BYTES]);
     let crc_embedded = u32::from_le_bytes([full[16], full[17], full[18], full[19]]);
-    Decoded { data, verified: crc32(&data) == crc_embedded }
+    Decoded { data, verified: crc32(&data) == crc_embedded, errors_corrected: 0 }
+}
+
+// ── BCH ECC: shortened BCH(192,160), t=4 over GF(2^8) ─────────────────────────
+//
+// Generation-1 error correction for the embedded payload.  The 160 info bits
+// (128 data + 32 CRC) are protected by 32 parity bits (the reserved ECC field),
+// correcting up to 4 bit errors anywhere in the 192-bit codeword.  This module is
+// the standalone codec (Phase 1): systematic `encode_parity` + in-place `correct`.
+// It is *not* yet wired into embed/decode — that is Phase 2/3.
+//
+// Code: narrow-sense BCH, primitive poly 0x11D (x^8+x^4+x^3+x^2+1); generator
+// g = lcm(m_1,m_3,m_5,m_7), degree 32 → full code BCH(255,223,t=4), used
+// *shortened* to (192,160) (the top 63 info positions are implicit zeros).  A
+// binary code, so located errors are simple bit flips — no Forney magnitude step.
+//
+// Bit layout of a codeword (matches the embedded payload): `[info(160) | parity(32)]`.
+//   external index → polynomial degree:  info  idx j      ↔ x^(32+j)
+//                                         parity idx 160+i ↔ x^i
+pub mod bch {
+    use std::sync::OnceLock;
+
+    const GF_POLY: usize = 0x11D; // x^8 + x^4 + x^3 + x^2 + 1 (primitive)
+    const N:       usize = 255;   // full code length (2^8 − 1)
+    pub const T:           usize = 4;   // correctable errors
+    pub const PARITY_BITS: usize = 32;
+    pub const INFO_BITS:   usize = 160;
+    pub const CODE_BITS:   usize = INFO_BITS + PARITY_BITS; // 192
+
+    // The codeword exactly fills the embedded payload (data+CRC = info, ECC = parity).
+    const _: () = assert!(CODE_BITS == super::PAYLOAD_BITS);
+
+    /// BCH codec: GF(2^8) exp/log tables + the degree-32 generator's binary taps.
+    pub struct Bch {
+        exp:  [u8; 512], // exp[i] = α^i  (doubled so log+log can't overflow the index)
+        log:  [u8; 256], // log[α^i] = i
+        gbit: [bool; PARITY_BITS + 1], // generator coefficients (all 0/1), x^0..x^32
+    }
+
+    /// Shared, lazily-built codec — the tables and generator are fixed constants.
+    pub fn shared() -> &'static Bch {
+        static B: OnceLock<Bch> = OnceLock::new();
+        B.get_or_init(Bch::new)
+    }
+
+    impl Default for Bch { fn default() -> Self { Bch::new() } }
+
+    impl Bch {
+        pub fn new() -> Self {
+            // GF(2^8) tables (α = 2 generates the field under 0x11D).
+            let mut exp = [0u8; 512];
+            let mut log = [0u8; 256];
+            let mut x = 1usize;
+            for i in 0..N {
+                exp[i] = x as u8;
+                log[x] = i as u8;
+                x <<= 1;
+                if x & 0x100 != 0 { x ^= GF_POLY; }
+            }
+            for i in N..(2 * N) { exp[i] = exp[i - N]; }
+
+            let mut me = Bch { exp, log, gbit: [false; PARITY_BITS + 1] };
+
+            // Roots = union of the cyclotomic cosets of 1..=2t (→ cosets of 1,3,5,7).
+            let mut is_root = [false; N];
+            for i in 1..=(2 * T) {
+                let mut j = i;
+                loop { is_root[j] = true; j = (j * 2) % N; if j == i { break; } }
+            }
+            // g(x) = Π_{j : is_root[j]} (x + α^j) — the coefficients come out binary.
+            let mut g = vec![1u8];
+            for j in 0..N {
+                if !is_root[j] { continue; }
+                let r = me.exp[j];
+                let mut ng = vec![0u8; g.len() + 1];
+                for k in 0..g.len() {
+                    ng[k + 1] ^= g[k];              // x·g
+                    ng[k]     ^= me.gf_mul(g[k], r); // r·g
+                }
+                g = ng;
+            }
+            assert_eq!(g.len(), PARITY_BITS + 1, "BCH generator must have degree 32");
+            for (k, &c) in g.iter().enumerate() {
+                debug_assert!(c == 0 || c == 1, "non-binary generator coefficient");
+                me.gbit[k] = c != 0;
+            }
+            me
+        }
+
+        #[inline]
+        fn gf_mul(&self, a: u8, b: u8) -> u8 {
+            if a == 0 || b == 0 { 0 }
+            else { self.exp[self.log[a as usize] as usize + self.log[b as usize] as usize] }
+        }
+        #[inline]
+        fn gf_inv(&self, a: u8) -> u8 { self.exp[(N - self.log[a as usize] as usize) % N] }
+
+        /// Systematic parity for `info` (length `INFO_BITS`): the remainder of
+        /// (info · x^32) mod g(x) over GF(2).  `info[j]` is the coefficient of
+        /// x^(32+j); `parity[i]` is the coefficient of x^i.
+        pub fn encode_parity(&self, info: &[bool]) -> [bool; PARITY_BITS] {
+            debug_assert_eq!(info.len(), INFO_BITS);
+            let mut d = [false; CODE_BITS]; // degree-indexed dividend
+            for j in 0..INFO_BITS { d[PARITY_BITS + j] = info[j]; }
+            for deg in (PARITY_BITS..CODE_BITS).rev() {
+                if d[deg] {
+                    for k in 0..=PARITY_BITS {
+                        if self.gbit[k] { d[deg - PARITY_BITS + k] ^= true; }
+                    }
+                }
+            }
+            let mut parity = [false; PARITY_BITS];
+            parity.copy_from_slice(&d[..PARITY_BITS]);
+            parity
+        }
+
+        /// Correct up to `T` bit errors in a 192-bit codeword laid out as
+        /// `[info(160) | parity(32)]`.  Returns the number of errors corrected
+        /// (0 if already clean), or `None` if uncorrectable (> T errors, or a root
+        /// located in the implicit shortening region).
+        pub fn correct(&self, code: &mut [bool; CODE_BITS]) -> Option<usize> {
+            let deg_of = |idx: usize| if idx < INFO_BITS { idx + PARITY_BITS } else { idx - INFO_BITS };
+
+            // Syndromes S_j = c(α^j), j = 1..=2t.
+            let mut synd = [0u8; 2 * T];
+            let mut any = false;
+            for j in 1..=(2 * T) {
+                let mut acc = 0u8;
+                for idx in 0..CODE_BITS {
+                    if code[idx] { acc ^= self.exp[(deg_of(idx) * j) % N]; }
+                }
+                synd[j - 1] = acc;
+                if acc != 0 { any = true; }
+            }
+            if !any { return Some(0); }
+
+            // Error-locator σ(x) via Berlekamp–Massey.
+            let sigma = self.berlekamp_massey(&synd);
+            let l = sigma.len() - 1;
+            if l == 0 || l > T { return None; }
+
+            // Chien search: an error sits at degree e ⟺ σ(α^{-e}) = 0.
+            let mut errs = Vec::with_capacity(l);
+            for e in 0..N {
+                let xinv = self.exp[(N - (e % N)) % N];
+                let mut v = 0u8;
+                let mut xp = 1u8;
+                for &s in &sigma {
+                    v ^= self.gf_mul(s, xp);
+                    xp = self.gf_mul(xp, xinv);
+                }
+                if v == 0 { errs.push(e); }
+            }
+            if errs.len() != l { return None; }                       // couldn't locate all errors
+            for &e in &errs { if e >= CODE_BITS { return None; } }    // root in the shortened pad
+
+            for &e in &errs {
+                let idx = if e < PARITY_BITS { INFO_BITS + e } else { e - PARITY_BITS };
+                code[idx] ^= true;
+            }
+            Some(errs.len())
+        }
+
+        /// Shortest-LFSR synthesis of the error locator from the syndromes.
+        /// Returns σ with σ[0] = 1; deg σ = number of errors.
+        fn berlekamp_massey(&self, s: &[u8]) -> Vec<u8> {
+            let mut sigma = vec![1u8];
+            let mut b     = vec![1u8];
+            let mut l     = 0usize;
+            let mut m     = 1usize;
+            let mut bb    = 1u8;
+            for n in 0..s.len() {
+                let mut d = s[n];
+                for i in 1..=l {
+                    if i <= n { if let Some(&si) = sigma.get(i) { d ^= self.gf_mul(si, s[n - i]); } }
+                }
+                if d == 0 {
+                    m += 1;
+                } else if 2 * l <= n {
+                    let prev = sigma.clone();
+                    let coef = self.gf_mul(d, self.gf_inv(bb));
+                    self.poly_add_shift(&mut sigma, &b, coef, m);
+                    l = n + 1 - l;
+                    b = prev;
+                    bb = d;
+                    m = 1;
+                } else {
+                    let coef = self.gf_mul(d, self.gf_inv(bb));
+                    self.poly_add_shift(&mut sigma, &b, coef, m);
+                    m += 1;
+                }
+            }
+            while sigma.len() > 1 && *sigma.last().unwrap() == 0 { sigma.pop(); }
+            sigma
+        }
+
+        /// σ(x) += coef · x^m · b(x)  (GF(2^8); add = XOR).
+        fn poly_add_shift(&self, sigma: &mut Vec<u8>, b: &[u8], coef: u8, m: usize) {
+            if coef == 0 { return; }
+            if sigma.len() < b.len() + m { sigma.resize(b.len() + m, 0); }
+            for i in 0..b.len() { sigma[i + m] ^= self.gf_mul(coef, b[i]); }
+        }
+    }
 }
 
 // Perceptual masking (Stage 2): per-coefficient embedding strength is scaled by
@@ -303,6 +541,29 @@ fn bits_to_payload(bits: &[bool; PAYLOAD_BITS]) -> [u8; FULL_BYTES] {
         for k in 0..8 { if bits[b * 8 + k] { *byte |= 1 << k; } }
     }
     out
+}
+
+/// Recover a `Decoded` from 192 raw payload bits, applying error correction.
+///
+/// **CRC-first → ECC-on-failure → CRC-recheck.**  A clean read (CRC already valid)
+/// is returned immediately with zero corrections — so a good decode is never
+/// disturbed by ECC.  Only on CRC failure is BCH run; if it corrects the codeword
+/// *and* the CRC then verifies, the corrected data is returned with the error
+/// count.  Otherwise the unverified raw decode is returned.  The CRC stays the
+/// final oracle — ECC proposes, CRC disposes, so false-accepts stay ~2⁻³².
+fn decode_bits(bits: &[bool; PAYLOAD_BITS]) -> Decoded {
+    // Generation dispatch: one channel generation today (`GEN1`).  When a second
+    // exists, try each here in turn and accept the first whose integrity verifies.
+    let raw = split_payload(&bits_to_payload(bits));
+    if raw.verified { return raw; }
+    let mut code = *bits; // codeword layout is already [info(160) | parity(32)]
+    if let Some(n) = bch::shared().correct(&mut code) {
+        if n > 0 {
+            let fixed = split_payload(&bits_to_payload(&code));
+            if fixed.verified { return Decoded { errors_corrected: n as u8, ..fixed }; }
+        }
+    }
+    raw
 }
 
 // ── Subband embed / decode ────────────────────────────────────────────────────
@@ -554,7 +815,7 @@ pub fn decode_y(y: &[f32], width: usize, height: usize) -> [u8; DATA_BYTES] {
     let total = correlate_embed_levels(y, width, height);
     let mut bits = [false; PAYLOAD_BITS];
     for (i, b) in bits.iter_mut().enumerate() { *b = total[i] > 0.0; }
-    split_payload(&bits_to_payload(&bits)).data
+    decode_bits(&bits).data
 }
 
 /// Accumulate per-bit correlation over exactly the embedded subbands
@@ -616,7 +877,7 @@ pub fn decode_y_at_size_verbose(
     let score: f32 = total.iter().map(|v| v.abs()).sum();
     let mut bits = [false; PAYLOAD_BITS];
     for (i, b) in bits.iter_mut().enumerate() { *b = total[i] > 0.0; }
-    (split_payload(&bits_to_payload(&bits)), score)
+    (decode_bits(&bits), score)
 }
 
 // ── Debug / visual verification ──────────────────────────────────────────────
@@ -665,6 +926,7 @@ pub mod registration {
     pub struct BlindResult {
         pub data:       [u8; DATA_BYTES],
         pub verified:   bool,          // CRC-32 over `data` matched the embedded checksum
+        pub errors_corrected: u8,      // BCH bit-errors corrected before the CRC verified
         pub scale:      f32,            // recovered suspect scale (≈ size / original)
         pub offset:     (usize, usize),// recovered tile-phase offset (mod FOLD)
         pub confidence: f32,           // phase-peak prominence (peak ÷ median); ≫1 = solid
@@ -822,7 +1084,7 @@ pub mod registration {
         let smed = { let mut s = score.clone(); s.sort_by(|a, b| a.partial_cmp(b).unwrap()); s[s.len() / 2].max(1e-6) };
         let mut bits = [false; PAYLOAD_BITS];
         for (b, m) in maps.iter().enumerate() { bits[b] = m[bp] > 0.0; }
-        (split_payload(&bits_to_payload(&bits)), bv / smed, bp % FOLD, bp / FOLD)
+        (decode_bits(&bits), bv / smed, bp % FOLD, bp / FOLD)
     }
 
     /// Progress events emitted during a blind decode, for an optional UI.  The
@@ -864,7 +1126,7 @@ pub mod registration {
 
         // Refine: nudge scale ±, pick the strongest phase peak; that decode is the result.
         let total = (2 * REFINE_STEPS + 1) as usize;
-        let mut best = (Decoded { data: [0u8; DATA_BYTES], verified: false }, f32::MIN, (0usize, 0usize), s0);
+        let mut best = (Decoded { data: [0u8; DATA_BYTES], verified: false, errors_corrected: 0 }, f32::MIN, (0usize, 0usize), s0);
         for (idx, k) in (-REFINE_STEPS..=REFINE_STEPS).enumerate() {
             let s = s0 * (1.0 + REFINE_FRAC * k as f32);
             let inv = 1.0 / s;
@@ -876,7 +1138,7 @@ pub mod registration {
             let better = (dec.verified && !best.0.verified) || (dec.verified == best.0.verified && prom > best.1);
             if better { best = (dec, prom, (ox, oy), s); }
         }
-        BlindResult { data: best.0.data, verified: best.0.verified, scale: best.3, offset: best.2, confidence: best.1 }
+        BlindResult { data: best.0.data, verified: best.0.verified, errors_corrected: best.0.errors_corrected, scale: best.3, offset: best.2, confidence: best.1 }
     }
 }
 
@@ -1015,6 +1277,151 @@ mod tests {
         assert_eq!(pixels[1], 123);
         assert_eq!(pixels[2], 83);
         assert_eq!(pixels[3], 255, "alpha must not change");
+    }
+
+    // ── BCH ECC (Phase 1: standalone codec) ──────────────────────────────────
+
+    fn rand_info(state: &mut u64) -> [bool; bch::INFO_BITS] {
+        let mut info = [false; bch::INFO_BITS];
+        for b in info.iter_mut() { *b = xorshift64(state) & 1 == 1; }
+        info
+    }
+
+    fn make_codeword(codec: &bch::Bch, info: &[bool; bch::INFO_BITS]) -> [bool; bch::CODE_BITS] {
+        let parity = codec.encode_parity(info);
+        let mut code = [false; bch::CODE_BITS];
+        code[..bch::INFO_BITS].copy_from_slice(info);
+        code[bch::INFO_BITS..].copy_from_slice(&parity);
+        code
+    }
+
+    fn inject_distinct(code: &mut [bool; bch::CODE_BITS], n: usize, state: &mut u64) -> Vec<usize> {
+        let mut chosen = Vec::with_capacity(n);
+        while chosen.len() < n {
+            let p = (xorshift64(state) as usize) % bch::CODE_BITS;
+            if !chosen.contains(&p) { chosen.push(p); code[p] ^= true; }
+        }
+        chosen
+    }
+
+    #[test]
+    fn bch_clean_codeword_decodes_with_zero_errors() {
+        let codec = bch::Bch::new();
+        let mut st = 0x1234_5678_9abc_def0u64;
+        let info = rand_info(&mut st);
+        let mut code = make_codeword(&codec, &info);
+        let orig = code;
+        // A validly-encoded codeword has zero syndromes → 0 corrections, untouched.
+        assert_eq!(codec.correct(&mut code), Some(0), "clean codeword should report 0 errors");
+        assert_eq!(code, orig, "clean codeword must be unchanged");
+    }
+
+    #[test]
+    fn bch_corrects_every_single_bit_error() {
+        let codec = bch::Bch::new();
+        let mut st = 0xdead_beef_0bad_f00du64;
+        let info = rand_info(&mut st);
+        let code0 = make_codeword(&codec, &info);
+        for pos in 0..bch::CODE_BITS {
+            let mut code = code0;
+            code[pos] ^= true;
+            assert_eq!(codec.correct(&mut code), Some(1), "pos {pos}: not reported as 1 error");
+            assert_eq!(code, code0, "pos {pos}: not corrected");
+        }
+    }
+
+    #[test]
+    fn bch_corrects_up_to_four_errors() {
+        let codec = bch::Bch::new();
+        let mut st = 0x0123_4567_89ab_cdefu64;
+        for _ in 0..3000 {
+            let info = rand_info(&mut st);
+            let code0 = make_codeword(&codec, &info);
+            let nerr = 1 + (xorshift64(&mut st) % (bch::T as u64)) as usize; // 1..=4
+            let mut code = code0;
+            inject_distinct(&mut code, nerr, &mut st);
+            assert_eq!(codec.correct(&mut code), Some(nerr), "expected {nerr} errors corrected");
+            assert_eq!(code, code0, "≤4 errors not fully corrected");
+        }
+    }
+
+    #[test]
+    fn full_payload_is_a_valid_bch_codeword() {
+        // Phase 2: the reserved ECC bytes now carry BCH parity, so the assembled
+        // 192-bit payload is a valid codeword — correct() reports 0 errors — and a
+        // single induced flip is corrected back to it.
+        let data: [u8; DATA_BYTES] = [
+            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+        ];
+        let bits = payload_to_bits(&full_payload(&data));
+        let mut code = [false; bch::CODE_BITS];
+        code.copy_from_slice(&bits);
+        let codec = bch::Bch::new();
+        assert_eq!(codec.correct(&mut code), Some(0), "fresh payload must be a valid codeword");
+        let clean = code;
+        code[42] ^= true;
+        assert_eq!(codec.correct(&mut code), Some(1));
+        assert_eq!(code, clean, "single flip not corrected back to the codeword");
+    }
+
+    #[test]
+    fn decode_bits_ecc_rescues_up_to_four_data_errors() {
+        // Phase 3: decode_bits applies CRC-first → ECC-on-failure → CRC-recheck.
+        let data: [u8; DATA_BYTES] = [
+            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+        ];
+        let clean = payload_to_bits(&full_payload(&data));
+
+        // Clean read → verified, no correction needed.
+        let d0 = decode_bits(&clean);
+        assert!(d0.verified && d0.errors_corrected == 0 && d0.data == data, "clean decode");
+
+        // 1..=4 flips in the info region (data+CRC) break the CRC, so ECC must run
+        // and rescue them — recovering the data and reporting the exact count.
+        let mut st = 0xABCD_1234_5678_9999u64;
+        for k in 1..=4usize {
+            for _ in 0..200 {
+                let mut bits = clean;
+                let mut chosen = Vec::new();
+                while chosen.len() < k {
+                    let p = (xorshift64(&mut st) as usize) % bch::INFO_BITS;
+                    if !chosen.contains(&p) { chosen.push(p); bits[p] ^= true; }
+                }
+                let d = decode_bits(&bits);
+                assert!(d.verified, "k={k}: ECC failed to rescue");
+                assert_eq!(d.data, data, "k={k}: wrong data after correction");
+                assert_eq!(d.errors_corrected as usize, k, "k={k}: wrong error count");
+            }
+        }
+
+        // Errors confined to the parity region: CRC-first short-circuits (the data
+        // is already clean), so no correction is reported.
+        let mut bits = clean;
+        bits[170] ^= true;
+        bits[180] ^= true;
+        let d = decode_bits(&bits);
+        assert!(d.verified && d.errors_corrected == 0, "parity-only errors shouldn't need ECC");
+        assert_eq!(d.data, data);
+    }
+
+    #[test]
+    fn bch_never_restores_original_beyond_t() {
+        // 5..=8 errors exceed t=4: the decoder must fail (None) or land on some
+        // *other* codeword — never silently restore the original (a false success).
+        let codec = bch::Bch::new();
+        let mut st = 0xfeed_face_cafe_babeu64;
+        for _ in 0..3000 {
+            let info = rand_info(&mut st);
+            let code0 = make_codeword(&codec, &info);
+            let nerr = 5 + (xorshift64(&mut st) % 4) as usize; // 5..=8
+            let mut code = code0;
+            inject_distinct(&mut code, nerr, &mut st);
+            if codec.correct(&mut code).is_some() {
+                assert_ne!(code, code0, "decoder falsely restored original from {nerr} errors");
+            }
+        }
     }
 
     // ── Phase 2: embed + immediate decode ────────────────────────────────────

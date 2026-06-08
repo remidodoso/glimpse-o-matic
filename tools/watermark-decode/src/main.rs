@@ -97,8 +97,8 @@ fn decode_file(path: &Path, mode: &Mode, verbose: bool) -> bool {
             // matched pass — if its CRC verifies, we're done instantly.
             let (dec, score) = watermark::decode_y_at_size_verbose(&y, w, h, w, h);
             if dec.verified {
-                if verbose { eprintln!("  · native matched decode → CRC verified"); }
-                println!("  detection : verified (CRC ok)  (native, score {:.0})", score);
+                if verbose { eprintln!("  · native matched decode → CRC verified{}", ecc_suffix(dec.errors_corrected)); }
+                println!("  detection : verified (CRC ok)  (native, score {:.0}){}", score, ecc_suffix(dec.errors_corrected));
                 print_fields(&dec.data);
             } else {
                 if verbose {
@@ -109,7 +109,7 @@ fn decode_file(path: &Path, mode: &Mode, verbose: bool) -> bool {
                               else if r.confidence >= 3.0 { "likely — CRC failed" }
                               else { "not detected" };
                 println!("  recovered : scale {:.3}, tile offset ({},{})", r.scale, r.offset.0, r.offset.1);
-                println!("  detection : {}  (confidence {:.1})", verdict, r.confidence);
+                println!("  detection : {}  (confidence {:.1}){}", verdict, r.confidence, ecc_suffix(r.errors_corrected));
                 print_fields(&r.data);
             }
         }
@@ -157,6 +157,12 @@ fn print_header(path: &Path, w: usize, h: usize) {
         w, h, (w * h) as f64 / 1_000_000.0, fmt_bytes(bytes));
 }
 
+/// Note appended to a verified detection line when ECC had to repair bit errors.
+fn ecc_suffix(n: u8) -> String {
+    if n == 0 { String::new() }
+    else { format!("  ·  ECC corrected {} bit error{}", n, if n == 1 { "" } else { "s" }) }
+}
+
 fn fmt_bytes(n: u64) -> String {
     if n >= 1_048_576 { format!("{:.1} MB", n as f64 / 1_048_576.0) }
     else if n >= 1024 { format!("{:.0} KB", n as f64 / 1024.0) }
@@ -170,11 +176,38 @@ fn print_detection_fixed(score: f32, dec: &watermark::Decoded) {
                else if score >= watermark::detection_strong() { "strong but CRC failed" }
                else if score >= watermark::detection_floor() { "weak — wrong size?" }
                else { "not detected" };
-    println!("  detection : {}  (score {:.0})", band, score);
+    println!("  detection : {}  (score {:.0}){}", band, score, ecc_suffix(dec.errors_corrected));
 }
 
 /// Print the decoded payload fields (no header / detection line).
 fn print_fields(p: &[u8; 16]) {
+    for line in field_lines(p) { println!("{line}"); }
+}
+
+/// Render the payload's fields, **dispatched on the version byte** (the semantic
+/// layer).  Channel decoding (CRC/ECC) is version-independent; only the meaning of
+/// the 16 data bytes evolves between versions, so an unknown version is dumped raw
+/// rather than mislabeled as the v1 fields.
+fn field_lines(p: &[u8; 16]) -> Vec<String> {
+    match p[15] {
+        1 => field_lines_v1(p),
+        v => vec![
+            format!("  version   : {}  (unknown payload format — fields not decoded)", v),
+            format!("  payload   : {}", hex_payload(p)),
+        ],
+    }
+}
+
+/// 4×4 grouped hex dump of the 16 data bytes.
+fn hex_payload(p: &[u8; 16]) -> String {
+    p.chunks(4)
+        .map(|c| c.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+/// Version-1 semantic layout: ts / ipv4 / browser fp / referrer hash / flags / version.
+fn field_lines_v1(p: &[u8; 16]) -> Vec<String> {
     let ts       = u32::from_le_bytes(p[0..4].try_into().unwrap());
     let fp       = u32::from_le_bytes(p[8..12].try_into().unwrap());
     let ref_hash = u16::from_le_bytes(p[12..14].try_into().unwrap());
@@ -200,17 +233,14 @@ fn print_fields(p: &[u8; 16]) {
         format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC  (unix {})", yr, mo, dy, hh, mm, ss, ts)
     };
 
-    let hex: String = p.chunks(4)
-        .map(|c| c.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" "))
-        .collect::<Vec<_>>()
-        .join("  ");
-
-    println!("  version   : {}", version);
-    println!("  timestamp : {}", ts_str);
-    println!("  ipv4      : {}", ip_str);
-    println!("  browser   : {:08x}", fp);
-    println!("  referrer  : {}", ref_str);
-    println!("  payload   : {}", hex);
+    vec![
+        format!("  version   : {}", version),
+        format!("  timestamp : {}", ts_str),
+        format!("  ipv4      : {}", ip_str),
+        format!("  browser   : {:08x}", fp),
+        format!("  referrer  : {}", ref_str),
+        format!("  payload   : {}", hex_payload(p)),
+    ]
 }
 
 // Gregorian calendar (Howard Hinnant's algorithm).
@@ -230,4 +260,30 @@ fn unix_to_datetime(ts: u32) -> (i32, u32, u32, u32, u32, u32) {
     let y   = yoe as i64 + era * 400 + if mo <= 2 { 1 } else { 0 };
 
     (y as i32, mo, d, h, mi, s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_one_decodes_named_fields() {
+        let mut p = [0u8; 16];
+        p[15] = 1;            // version 1
+        p[14] = 1;            // flags: referrer present
+        let lines = field_lines(&p);
+        assert!(lines.iter().any(|l| l.starts_with("  timestamp")), "v1 should label fields");
+        assert!(lines.iter().any(|l| l.contains("version   : 1")));
+        assert!(lines.iter().any(|l| l.contains("referrer  :")));
+    }
+
+    #[test]
+    fn unknown_version_is_dumped_raw_not_mislabeled() {
+        let mut p = [0u8; 16];
+        p[15] = 2;            // a future/unknown semantic version
+        let lines = field_lines(&p);
+        assert!(lines.iter().any(|l| l.contains("unknown payload format")), "should flag unknown");
+        assert!(!lines.iter().any(|l| l.contains("timestamp")), "must not mislabel as v1 fields");
+        assert!(lines.iter().any(|l| l.starts_with("  payload")), "raw bytes still shown");
+    }
 }
