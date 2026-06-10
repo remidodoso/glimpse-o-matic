@@ -54,6 +54,15 @@ fn is_image_ext(name: &str) -> bool {
     n.ends_with(".webp") || n.ends_with(".dat")
 }
 
+// Reserved social-preview entries: carried in the archive (for a future splash /
+// About panel) but never treated as gallery images. Ignored for now.
+fn is_reserved(name: &str) -> bool {
+    let base = name.rsplit('/').next().unwrap_or(name).to_ascii_lowercase();
+    matches!(base.as_str(),
+        "social_preview.jpg" | "social_preview.jpeg" |
+        "social_preview.png" | "social_preview.txt")
+}
+
 /// Exported for direct use where needed.
 #[wasm_bindgen]
 pub fn xor_decode(input: &[u8]) -> Vec<u8> {
@@ -229,7 +238,7 @@ impl GlimrRenderer {
                         break;
                     }
 
-                    if !name.ends_with('/') && is_image_ext(&name) {
+                    if !name.ends_with('/') && is_image_ext(&name) && !is_reserved(&name) {
                         let compressed = &self.stream_buf[..need];
                         let raw: Vec<u8> = match compression {
                             0 => compressed.to_vec(),

@@ -1,0 +1,45 @@
+# blind_auto_sweep test matrix — one case per line:  <image>  <encoding>  <scale>  <crop>
+#
+#   image     fixture stem (e.g. quyen), or * for every fixture in tests/fixtures/
+#   encoding  screenshot save format:
+#               raw      lossless capture (PNG-equivalent)
+#               q<NN>    JPEG quality NN  (use realistic screenshot qualities, ~80–95)
+#               w<NN>    WebP quality NN  (NOT YET IMPLEMENTED — these rows report "skip")
+#   scale     display scale applied first   (1.00 native, 0.50 half, 1.50 enlarged)
+#   crop      pixels cropped from each edge AFTER scaling:  none | L:T:R:B
+#
+# Pipeline per case:  embed in RGB → scale (display) → crop (screenshot) → encode (save) → blind decode.
+# Run release: cargo test -p glimr --features registration --release blind_auto_sweep -- --ignored --nocapture
+
+tests:
+  # ── baseline: every fixture, untouched and at half scale ──
+  - "*      raw  1.00  none"
+  - "*      q90  1.00  none"
+  - "*      raw  0.50  none"
+  - "*      q90  0.50  none"
+
+  # ── realistic screenshot saves (every fixture) ──
+  - "*      q85  1.00  none"
+  - "*      q80  0.75  none"
+
+  # ── cropped screenshots (phase knocked out of alignment) ──
+  - "*      q90  1.00  130:200:0:0"
+  - "*      q85  0.66  60:60:60:60"
+
+  # ── non-dyadic and upward rescales (spot-checked, not every fixture) ──
+  - "riley  q80  0.90  none"
+  - "riley  q70  0.70  none"
+  - "riley  q50  0.60  none"
+  - "quyen  q80  1.20  none"
+  - "quyen  q40  0.66  10:10:10:10"
+  - "riley  q80  0.90  100:100:100:100"
+  - "riley  q70  0.70  200:200:200:200"
+  - "quyen  q50  0.60  200:200:200:200"
+  - "quyen  q80  1.20  none"
+  - "quyen  q40  0.66  none"
+  - "quyen  q90  0.37  none"
+  - "quyen  q85  1.50  none"
+  - "zia    raw  0.66  100:0:100:0"
+
+  # ── WebP placeholder (skipped until an external encoder is wired) ──
+  - "quyen  w90  1.00  none"

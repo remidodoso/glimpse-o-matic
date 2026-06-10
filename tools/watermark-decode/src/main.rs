@@ -19,6 +19,8 @@ fn usage() -> ! {
     eprintln!("Options (mutually exclusive; the fast path when the source size is known):");
     eprintln!("  --size WxH        original (embed) dimensions, e.g. --size 2500x2500");
     eprintln!("  --ref <original>  read original dimensions from a reference image file");
+    eprintln!("  --max-size N      cap the implied source long-dimension (px) the blind search");
+    eprintln!("                    considers (default 4000); raise for larger originals");
     eprintln!("  -v, --verbose     narrate the blind search (instead of the live progress bar)");
     eprintln!();
     eprintln!("Formats: JPEG, PNG, WebP.  A live one-line progress bar shows during blind recovery");
@@ -32,11 +34,20 @@ fn main() {
 
     let mut mode = Mode::Auto;
     let mut verbose = false;
+    let mut max_source = 4000usize;
     let mut files: Vec<String> = Vec::new();
     let mut i = 0;
     while i < raw.len() {
         match raw[i].as_str() {
             "-v" | "--verbose" => { verbose = true; i += 1; }
+            "--max-size" => {
+                let v = raw.get(i + 1).unwrap_or_else(|| usage());
+                max_source = v.parse().unwrap_or_else(|_| {
+                    eprintln!("error: --max-size expects a pixel count, e.g. 5000 (got '{}')", v);
+                    std::process::exit(1);
+                });
+                i += 2;
+            }
             "--size" => {
                 let v = raw.get(i + 1).unwrap_or_else(|| usage());
                 let (w, h) = parse_size(v).unwrap_or_else(|| {
@@ -64,7 +75,7 @@ fn main() {
 
     let mut any_error = false;
     for f in &files {
-        if !decode_file(Path::new(f), &mode, verbose) { any_error = true; }
+        if !decode_file(Path::new(f), &mode, max_source, verbose) { any_error = true; }
     }
     if any_error { std::process::exit(1); }
 }
@@ -74,7 +85,7 @@ fn parse_size(s: &str) -> Option<(usize, usize)> {
     Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
 }
 
-fn decode_file(path: &Path, mode: &Mode, verbose: bool) -> bool {
+fn decode_file(path: &Path, mode: &Mode, max_source: usize, verbose: bool) -> bool {
     let img = match image::open(path) {
         Ok(img) => img.into_rgb8(),
         Err(e)  => { eprintln!("error: {}: {}", path.display(), e); return false; }
@@ -104,7 +115,7 @@ fn decode_file(path: &Path, mode: &Mode, verbose: bool) -> bool {
                 if verbose {
                     eprintln!("  · native decode unverified (score {:.0}) → recovering blind…", score);
                 }
-                let r = blind_with_progress(&y, w, h, verbose);
+                let r = blind_with_progress(&y, w, h, max_source, verbose);
                 let verdict = if r.verified { "verified (CRC ok)" }
                               else if r.confidence >= 3.0 { "likely — CRC failed" }
                               else { "not detected" };
@@ -119,7 +130,7 @@ fn decode_file(path: &Path, mode: &Mode, verbose: bool) -> bool {
 
 /// Run the blind decode, rendering progress: a live one-line bar on an interactive
 /// terminal (stderr), or `--verbose` prose, or silent (redirected / non-TTY).
-fn blind_with_progress(y: &[f32], w: usize, h: usize, verbose: bool) -> watermark::registration::BlindResult {
+fn blind_with_progress(y: &[f32], w: usize, h: usize, max_source: usize, verbose: bool) -> watermark::registration::BlindResult {
     use watermark::registration::Progress::*;
     let bar = !verbose && std::io::stderr().is_terminal();
     let mut best_prom = 0.0f32;
@@ -157,7 +168,7 @@ fn blind_with_progress(y: &[f32], w: usize, h: usize, verbose: bool) -> watermar
             }
         }
     };
-    let r = watermark::registration::decode_blind_auto_cb(y, w, h, &mut cb);
+    let r = watermark::registration::decode_blind_auto_cb(y, w, h, max_source, &mut cb);
     if bar { eprint!("\r{:<60}\r", ""); let _ = std::io::stderr().flush(); } // erase the bar
     r
 }

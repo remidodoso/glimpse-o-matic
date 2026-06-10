@@ -127,6 +127,8 @@ fn main() {
     };
 
     let mut jpg_files: Vec<PathBuf> = Vec::new();
+    let mut preview_img: Option<(String, PathBuf)> = None; // (zip entry name, source path)
+    let mut preview_txt: Option<PathBuf> = None;
     let mut skipped = 0usize;
 
     for entry in entries {
@@ -142,10 +144,28 @@ fn main() {
             skipped += 1;
             continue;
         }
+        let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase();
         let ext = path.extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
+
+        // Reserved social-preview files: carried through un-encoded, not gallery images.
+        if fname == "social_preview.jpg" || fname == "social_preview.jpeg" {
+            if preview_img.is_none() { preview_img = Some(("social_preview.jpg".to_string(), path)); }
+            else { skipped += 1; }
+            continue;
+        }
+        if fname == "social_preview.png" {
+            if preview_img.is_none() { preview_img = Some(("social_preview.png".to_string(), path)); }
+            else { skipped += 1; }
+            continue;
+        }
+        if fname == "social_preview.txt" {
+            preview_txt = Some(path);
+            continue;
+        }
+
         if ext == "jpg" || ext == "jpeg" {
             jpg_files.push(path);
         } else {
@@ -154,7 +174,7 @@ fn main() {
     }
 
     if jpg_files.is_empty() {
-        eprintln!("warning: no .jpg files found in '{}'", args.input_dir);
+        eprintln!("warning: no gallery .jpg files found in '{}'", args.input_dir);
         std::process::exit(0);
     }
 
@@ -174,6 +194,23 @@ fn main() {
     let mut zip = zip::ZipWriter::new(zip_file);
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Stored);
+
+    // Social-preview assets first, plain (un-encoded), so a future splash can render as
+    // the stream opens. The glimr stream parser skips them; they are not gallery images.
+    for (name, src) in preview_img.iter().map(|(n, s)| (n.as_str(), s))
+        .chain(preview_txt.iter().map(|s| ("social_preview.txt", s)))
+    {
+        let data = match std::fs::read(src) {
+            Ok(d)  => d,
+            Err(e) => { eprintln!("error reading '{}': {}", src.display(), e); std::process::exit(2); }
+        };
+        if let Err(e) = zip.start_file(name, options) {
+            eprintln!("error writing zip entry: {}", e); std::process::exit(2);
+        }
+        if let Err(e) = zip.write_all(&data) {
+            eprintln!("error writing zip data: {}", e); std::process::exit(2);
+        }
+    }
 
     for (hash_name, src_path) in hash_names.iter().zip(jpg_files.iter()) {
         let data = match std::fs::read(src_path) {
@@ -210,6 +247,12 @@ fn main() {
     );
     if skipped > 0 {
         println!("{} item{} skipped", skipped, if skipped == 1 { "" } else { "s" });
+    }
+    if preview_img.is_some() || preview_txt.is_some() {
+        let mut parts: Vec<&str> = Vec::new();
+        if let Some((n, _)) = &preview_img { parts.push(n); }
+        if preview_txt.is_some() { parts.push("social_preview.txt"); }
+        println!("Social preview: {} (un-encoded)", parts.join(", "));
     }
     println!("Output: {} ({})", output_path.display(), format_size(zip_size));
 }

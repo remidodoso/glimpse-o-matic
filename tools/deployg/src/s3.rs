@@ -182,19 +182,23 @@ pub fn fmt_size(bytes: u64) -> String {
 
 fn mime_type(key: &str) -> &'static str {
     match key.rsplit('.').next().unwrap_or("") {
-        "html" => "text/html; charset=utf-8",
-        "js"   => "application/javascript",
-        "css"  => "text/css",
-        "png"  => "image/png",
-        "wasm" => "application/wasm",
-        "zip"  => "application/zip",
-        _      => "application/octet-stream",
+        "html"          => "text/html; charset=utf-8",
+        "js"            => "application/javascript",
+        "css"           => "text/css",
+        "png"           => "image/png",
+        "jpg" | "jpeg"  => "image/jpeg",
+        "txt"           => "text/plain; charset=utf-8",
+        "wasm"          => "application/wasm",
+        "zip"           => "application/zip",
+        _               => "application/octet-stream",
     }
 }
 
 /// Upload a local file to `bucket` under `key` (which includes the prefix).
 /// R2 requires Content-Length, so the file is loaded into memory before sending.
 /// Prints a progress label then overwrites it with size + "done" on completion.
+/// Upload a local file to `bucket` under `key`. Reads the file, then delegates to
+/// `put_object_bytes`.
 pub fn put_object(
     endpoint:   &str,
     bucket:     &str,
@@ -204,21 +208,32 @@ pub fn put_object(
     access_key: &str,
     secret_key: &str,
 ) -> Result<(), String> {
+    let data = std::fs::read(src_path)
+        .map_err(|e| format!("cannot read {}: {}", src_path.display(), e))?;
+    put_object_bytes(endpoint, bucket, key, &data, label, access_key, secret_key)
+}
+
+/// Upload in-memory bytes to `bucket` under `key`. R2 requires Content-Length, so the
+/// whole body is sent at once. Content-type is derived from the key's extension.
+pub fn put_object_bytes(
+    endpoint:   &str,
+    bucket:     &str,
+    key:        &str,
+    data:       &[u8],
+    label:      &str,
+    access_key: &str,
+    secret_key: &str,
+) -> Result<(), String> {
     use std::io::Write as _;
 
     let host    = host_of(endpoint);
     let s3_path = format!("/{}/{}", bucket, key);
     let mime    = mime_type(key);
 
-    // Show "uploading" state while reading from disk
     print!("  {:<22}  uploading...\r", label);
     std::io::stdout().flush().ok();
 
-    let data = std::fs::read(src_path)
-        .map_err(|e| format!("cannot read {}: {}", src_path.display(), e))?;
-
-    // Compute real payload hash now that we have the bytes
-    let body_hash = sigv4::sha256_hex(&data);
+    let body_hash = sigv4::sha256_hex(data);
     let extra     = [("content-type", mime)];
     let signed    = sigv4::sign_with_hash(
         "PUT", host, &s3_path, &[], &extra, &body_hash, access_key, secret_key,
@@ -229,10 +244,9 @@ pub fn put_object(
     for (k, v) in &signed { req = req.set(k, v); }
     for (k, v) in &extra  { req = req.set(k, v); }
 
-    req.send_bytes(&data)
+    req.send_bytes(data)
         .map_err(|e| map_err(e, &format!("upload {}", label)))?;
 
-    // Overwrite the "uploading..." line with the final done entry
     let done = format!("  {:<22}  {}  done", label, fmt_size(data.len() as u64));
     println!("\r{:<55}", done);
     std::io::stdout().flush().ok();

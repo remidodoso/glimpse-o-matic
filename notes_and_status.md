@@ -507,6 +507,62 @@ renorm. **Measured result was a net negative:**
 
 ---
 
+## Blind decode — upscale-crop recovery (2026-06-09)
+
+**Symptom.** Zoomed-in screenshot crops (suspect *upscaled* vs the embed scale) failed to
+blind-decode, while *downscaled* crops decoded cleanly. Real cases: sstest51 (1591², true scale
+~1.49×), sstest52 (1691², zoom 2.0).
+
+**Investigation (measure-first).** A matched-filter prominence sweep over scale (bypassing the
+autocorr scale-finder) verified the payload for *all* the failing crops at their true scale —
+sstest50 @0.73, **sstest51 @1.49**, sstest52 @1.00. So the mark **survives the zoom**; the failure
+was purely the **coarse scale-finder not proposing the right scale** — not signal loss, and not the
+resampler (`resample_y` is an antialiased triangle filter with scale-aware support). Downscaling a
+failing crop 50% and re-feeding it decoded one-shot — same signal, relocated.
+
+**Root cause.** The scale-finder is an *unkeyed* spectrally-whitened autocorrelation; the watermark's
+periodicity is a spectral spike at bin ≈ N/period. **Upscaling pushes that spike toward DC** (period
+grows), where (a) the image's own low-frequency energy dominates and (b) the whitening's box-blur
+envelope (radius 6) is inflated by nearby DC energy → it divides the faint spike to nothing. A
+whitening-profile experiment confirmed it: at full res the true peak ranked **#32** (current r6),
+~#6 with a smaller radius but imprecise; at **½× it's rank #1 and exact** under any whitening. A
+bigger autocorr block does *not* help (more periods, but the peak's *frequency* is unchanged). The
+keyed matched filter is immune (it correlates the known tile, not spectral peaks).
+
+**Floors (clean, canonical fixture).** Matched (scale-known) verifies down to ~**896 px** source
+(768 just fails at 4 errs); below ~3.5 tiles the modulo-fold can't average enough and ECC is
+overwhelmed *even at the exact scale*. The blind finder fails **earlier** (~1024): at 896 the signal
+is perfect but the finder mis-locks the ½ harmonic, and the old ÷{1,2,3}-only ladder can't climb back
+up. So the finder, not the signal, was the bottleneck.
+
+**Fix (implemented, `glimr::registration`, native-only — not in the WASM viewer).**
+- **`--max-size` prune** (default 4000; new CLI flag on `watermark-decode`): candidate scale `s`
+  implies source `suspect_long/s`; skip any implying a source > max-size (`min_scale =
+  suspect_long/max_source`). Kills the absurd tiny-scale harmonics and their slow giant resamples;
+  can never drop the true scale.
+- **`MIN_SOURCE = 512`** high bound (`max_scale = suspect_long/512`): skip scales implying a source
+  < 512. Chosen at 512 (not the ~896 clean floor) on purpose — a strong-but-unreadable hit there
+  still surfaces the *"likely — CRC failed (confidence)"* verdict (useful "probably your photo" intel).
+- **Lazy multi-scale (pyramid) autocorr.** Run the period finder on the full image first (fast path
+  for native/downscale); **only on failure** descend to ½ then ¼ levels (skip a level if its image
+  < `PYRAMID_MIN_DIM` 384). A level-`d` lag `L` maps to full-image scale `L/(d·SCALE_REF)`, so
+  downscaled levels surface the *upscale* candidates the full-res finder is blind to. Decode runs at
+  **full resolution** (best signal) with the mapped scale.
+- **Prominence-ranked refine.** The refine pass now ±-nudges the *highest-prominence* coarse
+  candidates (not the first-N in try order) — needed since candidates span pyramid levels and the
+  winner may be deep in the list.
+
+**Results.** sstest50/51/52 all recover (sstest51 the 1.49× upscale → CRC ✓, payload read, conf 4.3).
+`blind_auto_sweep` 50 → **51/53** (one more passes, no regression); the 2 remaining failures are
+extreme `q50` + heavy-crop cases below the recovery floor even at their exact scale. Lazy tiering kept
+the common-case median ~3.1 s (vs 4.1 s eager all-tiers, ~2.8 s pre-pyramid). Considered and rejected:
+a keyed brute scale sweep (too slow — narrow notch ⇒ hundreds of `register_decode`s) and tuning the
+whitening alone (only partial; near-DC the image energy is fundamental).
+
+**Also:** `report_stamp` now emits **OS-local time** with offset (shells out like the git rev; UTC
+fallback) — UTC was silly on a local dev report. The investigation's `#[ignore]` probe tests +
+diagnostic fns were removed once the fix landed (cleaner versions to fold into a future report).
+
 ## Test & Demonstration Apparatus (2026-06-08)
 
 Reorganized the test suite around a committed, **browsable demonstration** model (with only a few
@@ -540,6 +596,16 @@ acceptance gates).  **Layout:**
   committed report yet).
 - **WebP** decode in `watermark-decode` (`image` `webp` feature, pure-Rust); integration-tested
   (incl. a real Bluesky-laundered WebP capture decoding).
+- **`blind_auto_sweep` preamble now self-documenting (2026-06-08):** added a full column legend and
+  a "reading the findings" note explaining that a `scale err = +100%` row sitting next to a `crc ✓`
+  is **not** a failure — it is the harmonic-sibling lock (decoder caught the 2× harmonic of the true
+  tile period; the self-similar PN tiling still decodes perfectly), so `scale err` reports *which
+  sibling won*, not accuracy. `crc` is the only pass/fail signal.
+- **Planned — broaden the sweep's stress envelope:** it is deliberately a *fast, legible* corner
+  today (scales 1.0/0.5, one crop offset, one JPEG quality, no rotation). Grow it toward the true
+  operating envelope: non-dyadic / upward rescales (0.37×, 0.75×, 1.5×), multiple & asymmetric crops,
+  lower JPEG qualities + WebP, small rotations / aspect changes, additive noise. Accept the longer
+  runtime (it stays `#[ignore]`); the fast acceptance gate (below) covers regressions.
 
 ### Planned — reports → public "journals" (.md + .html)
 
@@ -783,6 +849,37 @@ zone_id           = ...   ; Cloudflare zone ID for cache purge
 ---
 
 ## Social Preview (Open Graph)
+
+**STATUS — implemented 2026-06-09, differently from the plan below.** The route taken was *not*
+deployg-side pure-Rust rendering. Instead:
+- A standalone **browser tool `tools/social_preview/`** (`index.html`/`main.js`/`style.css`,
+  canvas-native, no build, runs from a static server) where the user composes the 1200×630 card:
+  drop / mouse-zoom / position a background image (fill-the-frame, generous zoom); pick + place a
+  logo from a pool (`logo-white.png` / `logo-black.png`, drop-shadow following alpha, click-to-select
+  with show/hide handles); a wrappable & clipped **title text box** — single-click select / move /
+  corner-resize (Shift = scale box+font, aspect-locked), double-click to edit via an overlaid
+  `<textarea>` (Enter commits, Shift-Enter newline); controls for justification, color, size (px
+  stepper, synced to shift-resize), font (curated cross-platform family **stacks** — Palatino,
+  Cambria, Verdana, Georgia, Gabriola, Lucida Sans, Consolas, Monotype Corsiva, Lucida Calligraphy),
+  and bold/italic. ⬇ Download emits a real **`social_preview.jpg`** (JPEG q0.92).
+  - *Gotcha learned:* must be a true JPEG, not a PNG renamed `.jpg` — **Signal honors `Content-Type`
+    and caps preview-image size**, so a mistyped/oversized PNG showed only a link icon (Bluesky
+    sniffs content and was forgiving). Hence the tool exports JPEG.
+- **Pipeline integration (this session):**
+  - **packg** recognizes `social_preview.{jpg,jpeg,png}` + `social_preview.txt`, stores them
+    **un-encoded (Stored, plain)** and **first** in the archive, excluded from the gallery image set.
+  - **glimr stream parser** (`is_reserved`) **skips** those reserved names — never treated as gallery
+    images. Parked at the front of the archive for a future splash / About panel (ignored for now).
+  - **deployg** reads the archive (added `zip` dep), uploads the image as a standalone
+    `{prefix}/social_preview.<ext>`, and **injects** OG/Twitter tags into a `<!--OG-->…<!--/OG-->`
+    block in that gallery's `index.html` (first txt line → `og:title`, remainder → `og:description`,
+    HTML-escaped; absolute URLs + `og:url` on R2, relative for local). Emits **only** the tags it has
+    data for; no preview files → byte-identical deploy (verdict-tier table in the deployg code).
+  - **Validated end-to-end:** R2 upload → Bluesky rendered the card exactly; Signal after the JPEG fix.
+
+_The original plan below (deployg-side `image`/`resvg` render) is retained for context but superseded._
+
+---
 
 Wanted soon. Goal: a shareable link card that, if "stolen," advertises the brand.
 

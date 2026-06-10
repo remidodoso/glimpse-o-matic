@@ -923,6 +923,18 @@ pub mod registration {
     // block holds only 2 → weak/ambiguous autocorr peak, which caused the full-scale
     // misses in the sweep).  Stage-1 prominence at 1.0×: ~18 (512) vs ~111 (1024).
     const SCALE_BLOCK: usize = 1024;
+    /// Default cap on the *implied source* long-dimension (px). A candidate scale `s`
+    /// implies a source of `suspect_long / s`; scales implying a source larger than this
+    /// are physically implausible (we don't release images this big) and are skipped —
+    /// which also kills the slow giant-resample candidates. Override per-call.
+    pub const DEFAULT_MAX_SOURCE: usize = 4000;
+    /// Smallest *implied source* long-dimension (px) worth a candidate. Below this a source
+    /// is too small to carry a recoverable mark (≈896 px verifies clean; we go to 512 so a
+    /// strong-but-unreadable hit still reports "likely"). Bounds the high-scale end.
+    const MIN_SOURCE: usize = 512;
+    /// Don't run an autocorr pyramid level whose (downscaled) image is smaller than this —
+    /// too little to find a period in.
+    const PYRAMID_MIN_DIM: usize = 384;
 
     /// Outcome of a blind decode.
     pub struct BlindResult {
@@ -1106,65 +1118,106 @@ pub mod registration {
     /// Blindly recover scale + crop offset and decode the payload from a suspect Y
     /// plane (cropped/rescaled, dimensions unknown).  No original image needed.
     pub fn decode_blind_auto(y: &[f32], w: usize, h: usize) -> BlindResult {
-        decode_blind_auto_cb(y, w, h, &mut |_| {})
+        decode_blind_auto_cb(y, w, h, DEFAULT_MAX_SOURCE, &mut |_| {})
     }
 
     /// Like `decode_blind_auto` but reports `Progress` events to `progress`.
+    /// `max_source` caps the implied source long-dimension (px): candidate scales that
+    /// would imply a larger original are skipped (see `DEFAULT_MAX_SOURCE`).
     pub fn decode_blind_auto_cb(
-        y: &[f32], w: usize, h: usize, progress: &mut dyn FnMut(Progress),
+        y: &[f32], w: usize, h: usize, max_source: usize, progress: &mut dyn FnMut(Progress),
     ) -> BlindResult {
+        use std::sync::OnceLock;
         let mut planner = FftPlanner::<f32>::new();
 
-        // Precompute template FFTs once.
+        // Template synthesis is image-independent — it depends only on the compile-time
+        // WM_KEY — so the inverse-DWT'd templates (the ~3 s cost) are built once per
+        // process and reused.  Fixed ~192 MiB (192 bits × 512² × f32).  The per-decode
+        // FFT (~0.5 s) is cheap enough to leave out of the cache.  The
+        // `building`/`transforming` phase split lets a caller time each step; once cached,
+        // `building` is ~0.  NOTE: if WM_KEY ever becomes runtime-configurable, key this.
+        static TEMPLATES: OnceLock<Vec<Vec<f32>>> = OnceLock::new();
         progress(Progress::Phase("building templates"));
-        let templates = bit_templates();
+        let templates = TEMPLATES.get_or_init(bit_templates);
+        progress(Progress::Phase("transforming templates"));
         let tfft: Vec<Vec<Complex<f32>>> = templates.iter().map(|t| {
             let mut f: Vec<Complex<f32>> = t.iter().map(|&v| Complex::new(v, 0.0)).collect();
             fft_2d(&mut f, FOLD, &mut planner, false);
             f
         }).collect();
 
-        // Candidate scales: the top-K autocorr peaks of the centre block, strongest
-        // first, **each expanded with its ½× and ⅓× harmonics**.  Downscaling low-passes
-        // the mark, so the strongest peak is often the level-3 / 2× harmonic and the true
-        // (level-2) period is its half — trying {s, s/2, s/3} recovers it.  CRC (with ECC)
-        // is the verdict: the first verified decode IS the answer, full stop — the exact
-        // scale/offset are incidental once the payload checks out.
+        // Candidate scales from a *lazy* autocorr pyramid.  The full-resolution peaks are
+        // tried first — the fast path for native/downscaled marks.  Only if nothing verifies
+        // do we descend to the ½ and ¼ levels: downscaling relocates an *upscaled* mark's
+        // near-DC periodicity into the detectable mid-band, surfacing the upscale candidates
+        // the full-res finder is blind to.  A level-`d` lag `L` maps to full-image scale
+        // `L/(d·SCALE_REF)`; each is expanded with ÷{1,2,3} harmonics and bounded by the
+        // implied source long-dimension: ≤ max_source (drops tiny scales ⇒ implausibly large
+        // source) and ≥ MIN_SOURCE (drops large scales ⇒ source too small to carry the mark).
+        // CRC (with ECC) is the verdict; the first verified decode is the answer.
         progress(Progress::Phase("estimating scale"));
-        let peaks = scale_peaks(y, w, h, CANDIDATES);
-        let mut tries: Vec<(f32, f32)> = Vec::new(); // (scale, parent autocorr strength), in try order
-        for &(lag, strength) in &peaks {
-            let s0 = lag as f32 / SCALE_REF as f32;
-            for div in [1.0f32, 2.0, 3.0] {
-                let s = (s0 / div).clamp(0.1, 4.0);
-                if !tries.iter().any(|&(t, _)| (t - s).abs() < 1e-3) { tries.push((s, strength)); }
-            }
-        }
-        if tries.is_empty() { tries.push((1.0, 0.0)); } // degenerate fallback
-        let total = tries.len();
+        let min_scale = if max_source > 0 { w.max(h) as f32 / max_source as f32 } else { 0.1 };
+        let max_scale = (w.max(h) as f32 / MIN_SOURCE as f32).min(4.0);
 
         let mut best = (Decoded { data: [0u8; DATA_BYTES], verified: false, errors_corrected: 0 },
-                        f32::MIN, (0usize, 0usize), tries[0].0);
+                        f32::MIN, (0usize, 0usize), 1.0f32);
+        let mut tried: Vec<f32> = Vec::new();          // scales tried (dedup across pyramid tiers)
+        let mut coarse: Vec<(f32, f32)> = Vec::new();  // (prominence, scale) for refine ranking
 
-        // Coarse pass — every candidate (peaks + harmonics) at its scale, strongest-peak
-        // first.  First CRC/ECC-verified decode wins.
-        for (ci, &(s, strength)) in tries.iter().enumerate() {
-            let inv = 1.0 / s;
-            let tw = ((w as f32 * inv).round() as usize).max(2 * FOLD);
-            let th = ((h as f32 * inv).round() as usize).max(2 * FOLD);
+        for &d in &[1.0f32, 0.5, 0.25] {
+            let (dw, dh) = if d == 1.0 { (w, h) } else { ((w as f32 * d) as usize, (h as f32 * d) as usize) };
+            if d != 1.0 && dw.min(dh) < PYRAMID_MIN_DIM { continue; } // too small to find a period
+            let peaks = if d == 1.0 { scale_peaks(y, w, h, CANDIDATES) }
+                        else { let dy = resample_y(y, w, h, dw, dh); scale_peaks(&dy, dw, dh, CANDIDATES) };
+
+            // Expand this tier's peaks into new, bounded, deduped candidate scales.
+            let mut tier: Vec<(f32, f32)> = Vec::new(); // (scale, strength)
+            for (lag, strength) in peaks {
+                let s0 = lag as f32 / (d * SCALE_REF as f32);
+                for div in [1.0f32, 2.0, 3.0] {
+                    let s = (s0 / div).clamp(0.1, 4.0);
+                    if s < min_scale || s > max_scale { continue; }
+                    if tried.iter().chain(tier.iter().map(|(t, _)| t)).any(|&t| (t - s).abs() < 1e-3) { continue; }
+                    tier.push((s, strength));
+                }
+            }
+
+            // Coarse pass over this tier; first CRC/ECC-verified decode wins.
+            for (s, strength) in tier {
+                tried.push(s);
+                let inv = 1.0 / s;
+                let tw = ((w as f32 * inv).round() as usize).max(2 * FOLD);
+                let th = ((h as f32 * inv).round() as usize).max(2 * FOLD);
+                let (dec, prom, ox, oy) = register_decode(y, w, h, tw, th, &tfft, &mut planner);
+                progress(Progress::Candidate { rank: tried.len(), total: tried.len(), scale: s, strength, prominence: prom, verified: dec.verified, errors: dec.errors_corrected });
+                if dec.verified {
+                    return BlindResult { data: dec.data, verified: true, errors_corrected: dec.errors_corrected, scale: s, offset: (ox, oy), confidence: prom };
+                }
+                coarse.push((prom, s));
+                if prom > best.1 { best = (dec, prom, (ox, oy), s); }
+            }
+        }
+
+        // Degenerate fallback: nothing survived the bounds → one native attempt.
+        if coarse.is_empty() {
+            let s = 1.0_f32.clamp(min_scale, max_scale.max(min_scale));
+            let tw = ((w as f32 / s).round() as usize).max(2 * FOLD);
+            let th = ((h as f32 / s).round() as usize).max(2 * FOLD);
             let (dec, prom, ox, oy) = register_decode(y, w, h, tw, th, &tfft, &mut planner);
-            progress(Progress::Candidate { rank: ci + 1, total, scale: s, strength, prominence: prom, verified: dec.verified, errors: dec.errors_corrected });
             if dec.verified {
                 return BlindResult { data: dec.data, verified: true, errors_corrected: dec.errors_corrected, scale: s, offset: (ox, oy), confidence: prom };
             }
-            if prom > best.1 { best = (dec, prom, (ox, oy), s); }
+            coarse.push((prom, s));
+            best = (dec, prom, (ox, oy), s);
         }
 
-        // Refine pass (the "extra effort") — only when no coarse candidate verified:
-        // ±nudge the most-promising scale into the narrow notch (the coarse autocorr lag
-        // is ~0.4%-quantized; the matched notch is <0.25%).
+        // Refine pass — ±nudge the *most prominent* coarse candidates into the narrow notch
+        // (autocorr lag is ~0.4%-quantized; the matched notch is <0.25%).  Ranking by
+        // prominence (not try-order) matters now that candidates span several pyramid levels
+        // — the winning scale may be deep in the list, not near the front.
+        coarse.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
         progress(Progress::Phase("refining (no clean candidate)"));
-        for (ci, &(s0, _)) in tries.iter().take(REFINE_CANDIDATES).enumerate() {
+        for (ci, &(_, s0)) in coarse.iter().take(REFINE_CANDIDATES).enumerate() {
             for k in -REFINE_STEPS..=REFINE_STEPS {
                 if k == 0 { continue; } // k=0 already covered by the coarse pass
                 let s = s0 * (1.0 + REFINE_FRAC * k as f32);
@@ -1873,7 +1926,27 @@ mod tests {
         (y, m as u32, d, h, mi, s)
     }
 
-    // One-line provenance stamp for generated reports: run time (UTC) + crate version
+    // Local-time stamp for reports.  std has no timezone support, so — like the git rev —
+    // we ask the OS, falling back to UTC if that fails.  e.g. "2026-06-09 15:30:00 -07:00".
+    fn local_timestamp() -> String {
+        let out = if cfg!(windows) {
+            std::process::Command::new("powershell")
+                .args(["-NoProfile", "-Command", "Get-Date -Format 'yyyy-MM-dd HH:mm:ss K'"])
+                .output().ok()
+        } else {
+            std::process::Command::new("date").arg("+%Y-%m-%d %H:%M:%S %z").output().ok()
+        };
+        if let Some(o) = out.filter(|o| o.status.success()) {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !s.is_empty() { return s; }
+        }
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs()).unwrap_or(0);
+        let (y, mo, d, h, mi, s) = unix_to_utc(ts);
+        format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC")
+    }
+
+    // One-line provenance stamp for generated reports: run time (local) + crate version
     // + git short-rev (with a `-dirty` flag for an uncommitted tree) + the config the
     // run used.  Lets a committed report say exactly when/what it was generated from.
     fn report_stamp() -> String {
@@ -1884,12 +1957,10 @@ mod tests {
         if git(&["status", "--porcelain"]).map(|s| !s.is_empty()).unwrap_or(false) {
             rev.push_str("-dirty");
         }
-        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs()).unwrap_or(0);
-        let (y, mo, d, h, mi, s) = unix_to_utc(ts);
-        format!("_Generated {y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC · glimr {ver} · commit `{rev}` · \
+        format!("_Generated {when} · glimr {ver} · commit `{rev}` · \
 config ALPHA={a}, levels={lv:?}, mask={mk}, ECC=BCH(192,160) t={t}._",
-            ver = env!("CARGO_PKG_VERSION"), a = ALPHA, lv = EMBED_LEVELS, mk = MASK_STRENGTH, t = bch::T)
+            when = local_timestamp(), ver = env!("CARGO_PKG_VERSION"),
+            a = ALPHA, lv = EMBED_LEVELS, mk = MASK_STRENGTH, t = bch::T)
     }
 
     // The default fixture for single-image tests: the first entry tagged `canonical`
@@ -1922,6 +1993,11 @@ config ALPHA={a}, levels={lv:?}, mask={mk}, ECC=BCH(192,160) t={t}._",
 
     fn crop_errs(p: &[u8; 16]) -> usize {
         PHASE3_PAYLOAD.iter().zip(p.iter()).map(|(a, b)| (a ^ b).count_ones() as usize).sum()
+    }
+
+    // Human-readable decode duration: sub-second in ms, else seconds.
+    fn fmt_secs(x: f64) -> String {
+        if x >= 1.0 { format!("{x:.1} s") } else { format!("{} ms", (x * 1000.0).round() as u64) }
     }
 
     // Copy a row-major RGB sub-rectangle out of a full-frame buffer.
@@ -2049,91 +2125,214 @@ _Lower errors / higher score = better. 0 errors = exact recovery._
         println!("crop tolerance report → {}", path.display());
     }
 
-
-    // Crop a Y (f32) sub-rectangle (used by the registration-gated sweeps).
-    #[cfg(feature = "registration")]
-    fn crop_rgb_y(src: &[f32], w: usize, x0: usize, y0: usize, cw: usize, ch: usize) -> Vec<f32> {
-        let mut out = vec![0.0f32; cw * ch];
-        for ry in 0..ch {
-            let s = (y0 + ry) * w + x0;
-            out[ry * cw..ry * cw + cw].copy_from_slice(&src[s..s + cw]);
-        }
-        out
-    }
-
-    // ── Step 2: blind `--auto` sweep across all image fixtures ─────────────────
+    // ── Step 2: blind `--auto` sweep, driven by tests/blind_sweep.yaml ─────────
     //
-    // For every `tests/fixtures/*.jpg`, embed → (optionally JPEG) → crop → rescale, then run
-    // the *fully blind* `decode_blind_auto` (recover scale + offset, decode) and
-    // record raw (pre-ECC) bit errors + confidence.  Measures the real envelope
-    // across varied content (clean vs busy) and sizes the ECC.  Requires the
-    // `registration` feature:
-    //   cargo test -p glimr --features registration blind_auto_sweep -- --ignored --nocapture
+    // For each case in the matrix, runs the *production* blind decoder
+    // (`decode_blind_auto_cb` — the same call `watermark-decode` makes) through the
+    // realistic capture chain: embed in RGB → scale (display) → crop (screenshot) →
+    // encode (save) → decode.  Records the decode wallclock (secondary figure of
+    // merit), the pre-/post-ECC state, and which candidate strategy won.  Always run
+    // **release** — debug is ~10× slower for no benefit:
+    //   cargo test -p glimr --features registration --release blind_auto_sweep -- --ignored --nocapture
     #[cfg(feature = "registration")]
     #[test]
     #[ignore]
     fn blind_auto_sweep() {
-        use image::{codecs::jpeg::JpegEncoder, ExtendedColorType, ImageEncoder};
+        use image::{codecs::jpeg::JpegEncoder, imageops::{self, FilterType},
+                    ExtendedColorType, ImageEncoder, RgbImage};
+        use registration::Progress;
+        use std::collections::HashMap;
+        use std::time::Instant;
+
+        #[derive(Clone)]
+        enum Enc { Raw, Jpeg(u8), Webp }
+        #[derive(Clone)]
+        struct Case { stem: String, path: std::path::PathBuf, enc: Enc, enc_label: String,
+                      scale: f32, crop: (u32, u32, u32, u32), crop_label: String }
+        enum Win { Coarse(usize, usize), Refine(usize) } // which candidate verified
 
         let reports = reports_dir();
 
-        let mut fixtures: Vec<std::path::PathBuf> = std::fs::read_dir(fixtures_dir()).unwrap()
+        // ── parse the matrix: one line per case, `<image> <enc> <scale> <crop>` ──
+        let cfg_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().join("tests").join("blind_sweep.yaml");
+        let yaml = std::fs::read_to_string(&cfg_path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {}", cfg_path.display(), e));
+        let doc: serde_yaml::Value = serde_yaml::from_str(&yaml)
+            .unwrap_or_else(|e| panic!("parse {}: {}", cfg_path.display(), e));
+        let lines: Vec<String> = doc.get("tests").and_then(|t| t.as_sequence())
+            .map(|seq| seq.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+
+        // all fixtures (stem, path), sorted — the `*` expansion set.
+        let mut fixtures: Vec<(String, std::path::PathBuf)> = std::fs::read_dir(fixtures_dir()).unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().map(|x| x == "jpg" || x == "jpeg").unwrap_or(false))
+            .map(|p| (p.file_stem().unwrap().to_string_lossy().to_string(), p))
             .collect();
         fixtures.sort();
+        let resolve = |stem: &str| -> std::path::PathBuf {
+            let jpg = fixtures_dir().join(format!("{stem}.jpg"));
+            if jpg.exists() { jpg } else { fixtures_dir().join(format!("{stem}.jpeg")) }
+        };
 
-        let scales  = [1.0f32, 0.5];
-        let offsets = [("none", 0usize, 0usize), ("crop 130,200", 130, 200)];
-        let jpegs   = [("raw", false), ("q80", true)];
-
-        let mut rows = String::new();
-        let (mut clean, mut total, mut verified) = (0usize, 0usize, 0usize);
-
-        for path in &fixtures {
-            let img = image::open(path).unwrap().into_rgb8();
-            let (ow, oh) = (img.width() as usize, img.height() as usize);
-            let pixels = img.into_raw();
-            let orig_y = extract_y_rgb(&pixels);
-
-            let mut wm_y = orig_y.clone();
-            embed_y_masked(&mut wm_y, ow, oh, &PHASE3_PAYLOAD, MASK_STRENGTH);
-
-            // Watermarked-then-JPEG'd Y (realistic compressed channel).
-            let wm_jpeg_y = {
-                let mut pw = pixels.clone();
-                write_y_delta_rgb(&mut pw, &orig_y, &wm_y);
-                let mut jpg = Vec::new();
-                JpegEncoder::new_with_quality(&mut jpg, 80)
-                    .write_image(&pw, ow as u32, oh as u32, ExtendedColorType::Rgb8).unwrap();
-                let dec = image::load_from_memory(&jpg).unwrap().into_rgb8();
-                extract_y_rgb(dec.as_raw())
+        let mut cases: Vec<Case> = Vec::new();
+        for line in &lines {
+            let t: Vec<&str> = line.split_whitespace().collect();
+            assert!(t.len() == 4, "blind_sweep.yaml: want `<image> <enc> <scale> <crop>`, got {line:?}");
+            let enc = if t[1] == "raw" { Enc::Raw }
+                else if let Some(q) = t[1].strip_prefix('q') {
+                    Enc::Jpeg(q.parse().unwrap_or_else(|_| panic!("bad jpeg quality in {line:?}"))) }
+                else if t[1].strip_prefix('w').is_some() { Enc::Webp }
+                else { panic!("blind_sweep.yaml: unknown encoding {:?} in {line:?}", t[1]) };
+            let scale: f32 = t[2].parse().unwrap_or_else(|_| panic!("bad scale in {line:?}"));
+            let crop = if t[3] == "none" { (0, 0, 0, 0) } else {
+                let p: Vec<u32> = t[3].split(':')
+                    .map(|x| x.parse().unwrap_or_else(|_| panic!("bad crop in {line:?}"))).collect();
+                assert!(p.len() == 4, "crop must be `none` or `L:T:R:B` in {line:?}");
+                (p[0], p[1], p[2], p[3])
             };
-
-            let name = path.file_name().unwrap().to_string_lossy().to_string();
-            for &(jlabel, jpeg) in &jpegs {
-                let base = if jpeg { &wm_jpeg_y } else { &wm_y };
-                for &s in &scales {
-                    for &(olabel, ox, oy) in &offsets {
-                        let (cw, ch) = (ow - ox, oh - oy);
-                        let cropped = crop_rgb_y(base, ow, ox, oy, cw, ch);
-                        let (nw, nh) = ((cw as f32 * s).round() as usize, (ch as f32 * s).round() as usize);
-                        let suspect = resample_y(&cropped, cw, ch, nw, nh);
-
-                        let r = registration::decode_blind_auto(&suspect, nw, nh);
-                        let errs = crop_errs(&r.data);
-                        let serr = (r.scale / s - 1.0) * 100.0;
-                        total += 1;
-                        if errs == 0 { clean += 1; }
-                        if r.verified { verified += 1; }
-                        rows.push_str(&format!(
-                            "| {:<13} | {:<3} | {:>4.2} | {:<12} | {:>+6.1}% | {:>6.1} | {:>3}/128 | {:^3} |\n",
-                            name, jlabel, s, olabel, serr, r.confidence, errs, if r.verified { "✓" } else { "·" }));
-                        println!("{name} {jlabel} s={s:.2} {olabel}: scale_err={serr:+.1}% conf={:.1} errs={errs} crc={}", r.confidence, r.verified);
-                    }
-                }
+            let imgs = if t[0] == "*" { fixtures.clone() }
+                       else { vec![(t[0].to_string(), resolve(t[0]))] };
+            for (stem, path) in imgs {
+                cases.push(Case { stem, path, enc: enc.clone(), enc_label: t[1].to_string(),
+                                  scale, crop, crop_label: t[3].to_string() });
             }
         }
+
+        // ── run the matrix ──
+        let mut wm_cache: HashMap<String, (Vec<u8>, usize, usize)> = HashMap::new();
+        let mut rows = String::new();
+        let (mut times, mut dwts, mut ffts, mut searches): (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)
+            = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut total, mut verified, mut clean, mut ecc_used, mut refined, mut skipped)
+            = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        let row = |s: &mut String, c: &Case, rec: &str, prom: &str, path: &str, time: &str, ecc: &str, crc: &str| {
+            s.push_str(&format!("| {:<10} | {:<4} | {:>5.2} | {:<12} | {:<12} | {:>5} | {:<7} | {:>8} | {:<8} | {:^3} |\n",
+                c.stem, c.enc_label, c.scale, c.crop_label, rec, prom, path, time, ecc, crc));
+        };
+
+        for c in &cases {
+            // WebP save: parsed but unimplemented (needs an external encoder) → skip row.
+            if let Enc::Webp = c.enc {
+                skipped += 1;
+                row(&mut rows, c, "—", "—", "skip", "—", "webp n/i", "—");
+                println!("{} {} s={:.2} {}: SKIP — WebP encode unimplemented", c.stem, c.enc_label, c.scale, c.crop_label);
+                continue;
+            }
+
+            // Watermarked RGB ("what's on screen"), composited once per fixture and cached.
+            let (wm_rgb, ow, oh) = wm_cache.entry(c.stem.clone()).or_insert_with(|| {
+                let img = image::open(&c.path)
+                    .unwrap_or_else(|e| panic!("open {}: {}", c.path.display(), e)).into_rgb8();
+                let (ow, oh) = (img.width() as usize, img.height() as usize);
+                let pixels = img.into_raw();
+                let orig_y = extract_y_rgb(&pixels);
+                let mut wm_y = orig_y.clone();
+                embed_y_masked(&mut wm_y, ow, oh, &PHASE3_PAYLOAD, MASK_STRENGTH);
+                let mut rgb = pixels;
+                write_y_delta_rgb(&mut rgb, &orig_y, &wm_y);
+                (rgb, ow, oh)
+            }).clone();
+
+            // scale (display) → crop (screenshot) → encode (save).
+            let src = RgbImage::from_raw(ow as u32, oh as u32, wm_rgb).unwrap();
+            let (nw, nh) = ((ow as f32 * c.scale).round() as u32, (oh as f32 * c.scale).round() as u32);
+            let scaled = if (c.scale - 1.0).abs() < 1e-6 { src }
+                         else { imageops::resize(&src, nw.max(1), nh.max(1), FilterType::Lanczos3) };
+            let (sw, sh) = (scaled.width(), scaled.height());
+
+            let (l, t, r, b) = c.crop;
+            let (cw, ch) = (sw.saturating_sub(l + r), sh.saturating_sub(t + b));
+            if cw < 16 || ch < 16 {
+                skipped += 1;
+                row(&mut rows, c, "—", "—", "crop!", "—", "too small", "—");
+                println!("{} {} s={:.2} {}: SKIP — crop leaves {cw}×{ch}", c.stem, c.enc_label, c.scale, c.crop_label);
+                continue;
+            }
+            let cropped = imageops::crop_imm(&scaled, l, t, cw, ch).to_image();
+
+            let final_rgb: Vec<u8> = match c.enc {
+                Enc::Raw => cropped.into_raw(),                       // lossless (PNG-equivalent) capture
+                Enc::Jpeg(q) => {                                    // JPEG-saved screenshot
+                    let mut buf = Vec::new();
+                    JpegEncoder::new_with_quality(&mut buf, q)
+                        .write_image(cropped.as_raw(), cw, ch, ExtendedColorType::Rgb8).unwrap();
+                    image::load_from_memory(&buf).unwrap().into_rgb8().into_raw()
+                }
+                Enc::Webp => unreachable!(),
+            };
+            let suspect = extract_y_rgb(&final_rgb);
+            let (dw, dh) = (cw as usize, ch as usize);
+
+            // ── timed, fully-blind decode (the production path) + winning-strategy capture ──
+            // Phase markers split the decode: `building`→`transforming` = inverse-DWT
+            // template synthesis; `transforming`→`estimating` = template FFTs; the rest
+            // is the candidate search.  (Both setup steps are image-independent — this is
+            // what the template cache removes.)
+            let mut win: Option<Win> = None;
+            let (mut t_build, mut t_transform, mut t_estimate): (Option<Instant>, Option<Instant>, Option<Instant>) = (None, None, None);
+            let r_res;
+            let elapsed;
+            {
+                let mut cb = |ev: Progress| match ev {
+                    Progress::Phase(p) => { let now = Instant::now(); match p {
+                        "building templates"     => t_build = Some(now),
+                        "transforming templates" => t_transform = Some(now),
+                        "estimating scale"        => t_estimate = Some(now),
+                        _ => {} } }
+                    Progress::Candidate { rank, total: tot, verified, .. } =>
+                        if verified { win = Some(Win::Coarse(rank, tot)); },
+                    Progress::Refine { candidate, verified, .. } =>
+                        if verified { win = Some(Win::Refine(candidate)); },
+                };
+                let t0 = Instant::now();
+                r_res = registration::decode_blind_auto_cb(&suspect, dw, dh, registration::DEFAULT_MAX_SOURCE, &mut cb);
+                elapsed = t0.elapsed();
+            }
+            let secs = elapsed.as_secs_f64();
+            let span = |a: Option<Instant>, b: Option<Instant>| match (a, b) {
+                (Some(a), Some(b)) => (b - a).as_secs_f64(), _ => 0.0 };
+            let dwt = span(t_build, t_transform);      // inverse-DWT template synthesis
+            let fft = span(t_transform, t_estimate);   // template FFTs
+            let search = (secs - dwt - fft).max(0.0);  // candidate search + decode
+            times.push(secs); dwts.push(dwt); ffts.push(fft); searches.push(search);
+
+            // CRC ✓ must mean the payload is genuinely correct — sanity-check against ground truth.
+            if r_res.verified { assert_eq!(crop_errs(&r_res.data), 0, "CRC verified but payload wrong"); }
+
+            total += 1;
+            if r_res.verified { verified += 1; }
+            if r_res.verified && r_res.errors_corrected == 0 { clean += 1; }
+            if r_res.errors_corrected > 0 { ecc_used += 1; }
+            if matches!(win, Some(Win::Refine(_))) { refined += 1; }
+
+            let ratio = if c.scale > 0.0 { r_res.scale / c.scale } else { 0.0 };
+            let recovered = format!("{:.2}x {}", r_res.scale, if (ratio - 1.0).abs() < 0.05 { "prim" } else { "harm" });
+            let prom_s = format!("{:.1}", r_res.confidence);
+            let path_s = match win {
+                Some(Win::Coarse(rk, tot)) => format!("C{rk}/{tot}"),
+                Some(Win::Refine(cd))      => format!("R c{cd}"),
+                None                       => "—".to_string(),
+            };
+            let time_s = fmt_secs(secs);
+            let ecc_s = if !r_res.verified { "FAIL".to_string() }
+                        else if r_res.errors_corrected == 0 { "clean".to_string() }
+                        else { format!("fixed {}", r_res.errors_corrected) };
+            let crc = if r_res.verified { "✓" } else { "✗" };
+
+            row(&mut rows, c, &recovered, &prom_s, &path_s, &time_s, &ecc_s, crc);
+            println!("{} {} s={:.2} {}: {} prom {} {} {} [tpl {:.1}s+fft {:.2}s, search {:.1}s] ECC={} crc={}",
+                c.stem, c.enc_label, c.scale, c.crop_label, recovered, prom_s, path_s, time_s, dwt, fft, search, ecc_s, r_res.verified);
+        }
+
+        let median = |v: &[f64]| -> f64 {
+            if v.is_empty() { return 0.0; }
+            let mut s = v.to_vec(); s.sort_by(|a, b| a.partial_cmp(b).unwrap()); s[s.len() / 2]
+        };
+        let (med, max) = (median(&times), times.iter().cloned().fold(0.0, f64::max));
+        let (med_dwt, med_fft, med_search) = (median(&dwts), median(&ffts), median(&searches));
+        let max_setup = dwts.iter().zip(ffts.iter()).map(|(a, b)| a + b).fold(0.0, f64::max);
 
         let stamp = report_stamp();
         let report = format!(
@@ -2141,27 +2340,67 @@ _Lower errors / higher score = better. 0 errors = exact recovery._
 
 {stamp}
 
-Embed (CDF 5/3, ALPHA={alpha}, levels {levels:?}, mask {mask}) → optional JPEG q80 → crop →
-rescale, then **fully blind** `decode_blind_auto` (recover scale + crop offset, decode —
-including ECC).  `errs` are residual bit errors *after* ECC, `crc` ✓ is the definitive verdict,
-`confidence` is the phase-peak prominence.  Measures the real end-to-end envelope across content.
+Each row drives the **production blind decoder** (`decode_blind_auto`, the same call the
+`watermark-decode` tool makes) through the realistic capture chain, given no hint of scale or crop:
 
-Fixtures: {fixtures} images via `tests/fixtures/*.jpg`.  **Clean (0-error) cells: {clean}/{total}; CRC-verified: {verified}/{total}.**
+> embed in RGB (CDF 5/3, ALPHA={alpha}, levels {levels:?}, mask {mask}) → **scale** (display) → **crop** (screenshot) → **encode** (save) → `decode_blind_auto`
 
-Regenerate: `cargo test -p glimr --features registration blind_auto_sweep -- --ignored --nocapture`
+The watermark is composited in uncompressed RGB (as on screen) and meets compression only at the
+screenshot-save step, so `enc` is the *save format*; the source photo's own JPEG history is
+irrelevant.  The matrix is defined in [`tests/blind_sweep.yaml`](../blind_sweep.yaml) — one line per case.
 
-| image         | jpg | scale | crop         | scale err | confidence | bit errors | crc |
-|---------------|-----|-------|--------------|-----------|------------|------------|-----|
+**{verified}/{total} CRC-verified · {clean}/{total} clean (no ECC) · {ecc_used} used ECC · {refined} needed refine · {skipped} skipped.**
+**Decode time (production path, release): median {med}, max {max}.**
+Per-decode split (median): templates {med_dwt} + FFT {med_fft} + search {med_search}; one-time template setup peaks at {max_setup}.
+
+Regenerate: `cargo test -p glimr --features registration --release blind_auto_sweep -- --ignored --nocapture`
+
+### Column legend
+
+| column | meaning |
+|---|---|
+| **image** | source fixture (stem). |
+| **enc** | screenshot save format: `raw` = lossless (PNG-equivalent), `q<NN>` = JPEG quality NN, `w<NN>` = WebP (unimplemented → skipped). |
+| **scale** | display scale applied before capture (`1.00` native, `0.50` half, `1.50` enlarged). |
+| **crop** | pixels cropped from each edge *after* scaling, `L:T:R:B` (or `none`). |
+| **recovered** | scale the blind decoder locked onto; `prim` = the true period, `harm` = a self-similar harmonic sibling (½×/⅓×). Both decode correctly — see note. |
+| **prom** | phase-peak *prominence* of the winning candidate (peak ÷ median) — how decisively it stood out. High = a clean lock; a low value next to a deep `path` is a marginal recovery. |
+| **path** | how it won: `C<r>/<n>` = coarse candidate *r* of *n*; `R c<k>` = needed the fine refine pass on candidate *k*. |
+| **time** | wallclock of the decode call only (excludes channel-simulation setup) — the secondary figure of merit. |
+| **ECC** | `clean` = raw CRC passed, no correction; `fixed N` = BCH repaired N bit errors; `FAIL` = CRC failed even after ECC. |
+| **crc** | the verdict: `✓` = full 128-bit payload recovered exactly. The only pass/fail signal. |
+
+### Why a `harm` recovery is not a failure
+
+A `recovered` tagged `harm` means the decoder locked a *harmonic* of the true tile period (e.g.
+reported 1.0× for a ½-size image) rather than the period itself.  Downscaling low-pass-filters the
+mark, so the strongest autocorrelation peak is often a harmonic; the decoder expands each peak into
+`{{s, s/2, s/3}}` siblings, and because the PN tiling is self-similar across them, decoding succeeds
+perfectly via a sibling.  `crc ✓` is the verdict.
+
+### Scope & future work
+
+Variety is driven entirely by `tests/blind_sweep.yaml` — add lines to widen the envelope.  Still to
+add as channel variables: small rotations, aspect changes, overlays, and additive noise.  WebP save
+(`w<NN>`) is parsed but stubbed — it needs an external encoder (planned: wrap `ffmpeg`/`cwebp`), so
+those cases report `skip`.
+
+| image      | enc  | scale | crop         | recovered    | prom  | path    | time     | ECC      | crc |
+|------------|------|-------|--------------|--------------|-------|---------|----------|----------|-----|
 {rows}
-_`crc` ✓ = the embedded CRC-32 verified (definitive). Cells with a few errors are ECC's job;\
- cells near 64/128 are registration failures (need more signal)._
+_The decode path is identical to the `watermark-decode` tool; this table is its behaviour and speed
+across a configurable matrix of realistic captures._
 ",
             alpha = ALPHA, levels = EMBED_LEVELS, mask = MASK_STRENGTH,
-            fixtures = fixtures.len(), clean = clean, total = total, verified = verified, rows = rows,
+            total = total, verified = verified, clean = clean, ecc_used = ecc_used,
+            refined = refined, skipped = skipped, med = fmt_secs(med), max = fmt_secs(max),
+            med_dwt = fmt_secs(med_dwt), med_fft = fmt_secs(med_fft),
+            med_search = fmt_secs(med_search), max_setup = fmt_secs(max_setup), rows = rows,
         );
         let path = reports.join("blind_auto_sweep.md");
         std::fs::write(&path, report).unwrap();
-        println!("blind --auto sweep → {}  ({clean}/{total} clean, {verified}/{total} crc-verified)", path.display());
+        println!("blind --auto sweep → {}  ({verified}/{total} crc-verified, median {}, max {})",
+            path.display(), fmt_secs(med), fmt_secs(max));
     }
 
     // ── Phase 5a: channel-quality waterfall (matched decode) ──────────────────

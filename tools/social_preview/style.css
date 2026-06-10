@@ -1,0 +1,233 @@
+:root {
+    /* Same button sizing as the main app's action buttons. */
+    --btn-size: min(max(100vw, 100vh) / 20, 48px);
+    --gray-stage: #8c8c8c;     /* neutral gray; the card's letterbox fill matches this */
+    --gray-toolbar: #3a3a3a;   /* slightly darker so the white tool icons read clearly */
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--gray-stage);
+    font-family: system-ui, -apple-system, sans-serif;
+    overflow: hidden;
+}
+
+body { display: flex; flex-direction: column; }
+
+/* ── Top tool strip ── */
+#toolbar {
+    flex: 0 0 auto;
+    height: calc(var(--btn-size) + 24px);
+    background: var(--gray-toolbar);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 16px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+    z-index: 10;
+}
+
+/* The download tool: the app's action-btn recipe, but fully opaque (no transparency). */
+.tool-btn {
+    width: var(--btn-size);
+    height: var(--btn-size);
+    background: transparent;
+    border: 2px solid white;
+    border-radius: 12px;
+    color: white;
+    opacity: 1;
+    box-shadow: 2px 4px 12px rgba(0, 0, 0, 0.7);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: calc(var(--btn-size) * 0.5);
+    cursor: pointer;
+    padding: 0;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-tap-highlight-color: transparent;
+}
+.tool-btn:active { transform: translateY(1px); }
+
+/* ── Text settings strip (same scale as the top toolbar) ── */
+#text-toolbar {
+    flex: 0 0 auto;
+    height: calc(var(--btn-size) + 24px);
+    background: var(--gray-toolbar);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 16px;
+    box-shadow: 0 1px 6px rgba(0, 0, 0, 0.35);
+    z-index: 9;
+}
+
+.align-btn svg {
+    width: 58%;
+    height: 58%;
+    display: block;
+}
+
+.tool-btn.active {
+    background: #fff;
+    color: var(--gray-toolbar);   /* icon (SVG currentColor / letter) turns dark on the white fill */
+}
+
+/* Bold / italic toggles: the glyph itself shows the style. */
+#btn-bold { font-weight: 800; }
+#btn-italic { font-style: italic; font-family: Georgia, "Times New Roman", serif; }
+
+/* Divider between control groups. */
+.toolbar-sep {
+    width: 1px;
+    align-self: stretch;
+    margin: 12px 6px;
+    background: rgba(255, 255, 255, 0.25);
+}
+
+/* Native color input, restyled as a clean rounded swatch of the current color. */
+.color-btn {
+    padding: 0;
+    overflow: hidden;
+    background: transparent;
+}
+.color-btn::-webkit-color-swatch-wrapper { padding: 0; }
+.color-btn::-webkit-color-swatch { border: none; border-radius: 9px; }
+.color-btn::-moz-color-swatch { border: none; border-radius: 9px; }
+
+/* Font-size field (output px), framed to match the toolbar buttons, with −/+ steppers. */
+.size-control {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    height: var(--btn-size);
+    padding: 0 2px;
+    border: 2px solid white;
+    border-radius: 12px;
+    color: white;
+    overflow: hidden;
+    box-shadow: 2px 4px 12px rgba(0, 0, 0, 0.7);
+}
+.size-step {
+    border: none;
+    background: transparent;
+    color: white;
+    cursor: pointer;
+    width: 1.5em;
+    height: 100%;
+    padding: 0;
+    line-height: 1;
+    font-size: calc(var(--btn-size) * 0.5);
+    user-select: none;
+}
+.size-step:hover { opacity: 0.7; }
+.size-step:active { opacity: 0.45; }
+.size-input {
+    width: 2.8em;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: white;
+    text-align: right;
+    font-family: inherit;
+    font-size: calc(var(--btn-size) * 0.36);
+    appearance: textfield;
+    -moz-appearance: textfield;
+}
+.size-input::-webkit-outer-spin-button,
+.size-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.size-suffix {
+    font-size: calc(var(--btn-size) * 0.3);
+    opacity: 0.75;
+    user-select: none;
+}
+
+/* Font-family picker, framed to match the toolbar. */
+.font-select {
+    height: var(--btn-size);
+    background: var(--gray-toolbar);
+    color: white;
+    border: 2px solid white;
+    border-radius: 12px;
+    padding: 0 8px;
+    font-family: inherit;
+    font-size: calc(var(--btn-size) * 0.34);
+    cursor: pointer;
+    box-shadow: 2px 4px 12px rgba(0, 0, 0, 0.7);
+}
+
+/* ── Logo pool: a slightly inset tray of selectable overlays ── */
+#logo-pool {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 10px 16px;
+    min-height: 64px;
+    overflow-x: auto;
+    background: var(--gray-stage);   /* same gray as the card → swatches read "as on the image" */
+    box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.45),
+                inset 0 -1px 4px rgba(0, 0, 0, 0.25);   /* recessed tray */
+}
+
+.logo-swatch {
+    height: 44px;
+    width: auto;
+    flex: 0 0 auto;
+    padding: 6px;                    /* breathing room between the logo and its selection frame */
+    cursor: pointer;
+    filter: drop-shadow(0 2px 5px rgba(0, 0, 0, 0.5));  /* silhouette shadow, like on the card */
+    -webkit-user-drag: none;
+    user-select: none;
+}
+
+.logo-swatch.selected {
+    outline: 1px solid red;          /* selection frame, in addition to the shadow */
+}
+
+/* ── Work area + card ── */
+#stage {
+    flex: 1 1 auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    padding: 24px;
+    position: relative;
+}
+
+#card {
+    /* Backing store is fixed 1200×630; scale down to fit while keeping aspect. */
+    max-width: 100%;
+    max-height: 100%;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);  /* lift the card off the same-gray stage */
+    cursor: grab;
+    touch-action: none;
+}
+#card.dragging { cursor: grabbing; }
+
+/* Drop-target highlight while a file is dragged over the stage. */
+#stage.dropping #card {
+    outline: 3px dashed rgba(255, 255, 255, 0.85);
+    outline-offset: -3px;
+}
+
+/* Transient text editor, overlaid exactly on the text box while editing.
+   Geometry, font, color, alignment, padding, shadow are all set inline per-edit. */
+#text-editor {
+    position: fixed;
+    margin: 0;
+    border: none;
+    outline: none;
+    background: transparent;
+    resize: none;
+    overflow: hidden;
+    box-sizing: border-box;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+    display: none;
+    z-index: 20;
+}

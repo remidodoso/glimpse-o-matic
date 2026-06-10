@@ -194,6 +194,7 @@ dependencies = [
  "hmac",
  "sha2",
  "ureq",
+ "zip",
 ]
 
 [[package]]

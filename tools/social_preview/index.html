@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Social Preview Maker</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- Tool palette: one tool for now (download). Grows rightward in later phases. -->
+    <div id="toolbar">
+        <button id="btn-download" class="tool-btn" title="Download card (PNG)">&#x2B07;</button>
+    </div>
+
+    <!-- Text settings: justification for now; more pickers added one at a time. -->
+    <div id="text-toolbar">
+        <button class="tool-btn align-btn" data-align="left" title="Align left">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                <line x1="3" y1="5"  x2="21" y2="5"/>
+                <line x1="3" y1="10" x2="14" y2="10"/>
+                <line x1="3" y1="15" x2="21" y2="15"/>
+                <line x1="3" y1="20" x2="14" y2="20"/>
+            </svg>
+        </button>
+        <button class="tool-btn align-btn" data-align="center" title="Align center">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                <line x1="3" y1="5"  x2="21" y2="5"/>
+                <line x1="7" y1="10" x2="17" y2="10"/>
+                <line x1="3" y1="15" x2="21" y2="15"/>
+                <line x1="7" y1="20" x2="17" y2="20"/>
+            </svg>
+        </button>
+        <button class="tool-btn align-btn" data-align="right" title="Align right">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                <line x1="3"  y1="5"  x2="21" y2="5"/>
+                <line x1="10" y1="10" x2="21" y2="10"/>
+                <line x1="3"  y1="15" x2="21" y2="15"/>
+                <line x1="10" y1="20" x2="21" y2="20"/>
+            </svg>
+        </button>
+
+        <span class="toolbar-sep"></span>
+
+        <input type="color" id="text-color" class="tool-btn color-btn" title="Text color" value="#ffffff">
+
+        <span class="toolbar-sep"></span>
+
+        <div class="size-control" title="Font size (px)">
+            <button type="button" class="size-step" id="size-dec" tabindex="-1">&#x2212;</button>
+            <input type="number" id="text-size" class="size-input" min="10" max="300" step="1">
+            <span class="size-suffix">px</span>
+            <button type="button" class="size-step" id="size-inc" tabindex="-1">+</button>
+        </div>
+
+        <span class="toolbar-sep"></span>
+
+        <select id="text-font" class="font-select" title="Font"></select>
+
+        <span class="toolbar-sep"></span>
+
+        <button id="btn-bold" class="tool-btn style-btn" title="Bold">B</button>
+        <button id="btn-italic" class="tool-btn style-btn" title="Italic">I</button>
+    </div>
+
+    <!-- Logo pool: click a swatch to make it the active overlay. Populated by main.js. -->
+    <div id="logo-pool"></div>
+
+    <!-- Work area: the fixed 1200×630 card, displayed scaled-to-fit. -->
+    <div id="stage">
+        <canvas id="card" width="1200" height="630"></canvas>
+    </div>
+
+    <script src="main.js"></script>
+</body>
+</html>
