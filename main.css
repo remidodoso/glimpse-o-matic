@@ -68,6 +68,7 @@ div.header {
     overflow-y: hidden;
     grid-area: header;
     scrollbar-width: none;
+    touch-action: none;   /* pointer-driven drag/throw handles panning (both axes) */
 }
 
 div.header::-webkit-scrollbar {

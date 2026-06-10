@@ -290,6 +290,10 @@ function __wbg_get_imports() {
             const ret = arg0.getSeconds();
             return ret;
         },
+        __wbg_height_ef5b5950872773b5: function(arg0) {
+            const ret = arg0.height;
+            return ret;
+        },
         __wbg_instanceof_CanvasRenderingContext2d_6f2951bc60fb6d97: function(arg0) {
             let result;
             try {
@@ -400,6 +404,10 @@ function __wbg_get_imports() {
         __wbg_static_accessor_WINDOW_e70ae9f2eb052253: function() {
             const ret = typeof window === 'undefined' ? null : window;
             return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+        },
+        __wbg_width_796e38875beab5e6: function(arg0) {
+            const ret = arg0.width;
+            return ret;
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
             // Cast intrinsic for `Ref(String) -> Externref`.

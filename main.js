@@ -38,6 +38,18 @@ var carousel_drag_start_y = 0;
 var carousel_scroll_start = 0;
 var carousel_drag_moved = false;
 
+// Carousel kinetic-scroll ("throw") state
+var carousel_pointer_id   = null;  // pointer captured for the active drag
+var carousel_vel          = 0;     // smoothed pointer velocity, active axis (px/ms)
+var carousel_last_pos     = 0;     // last pointer coord (active axis)
+var carousel_last_t       = 0;     // last pointer-move timestamp (ms)
+var carousel_inertia_raf  = 0;     // momentum rAF handle (0 = idle)
+var carousel_captured     = false; // did we setPointerCapture for this drag? (captured lazily)
+var CAROUSEL_FRICTION_TAU = 650;   // ms; larger = glidier — decays to a stop, never infinite
+var CAROUSEL_MIN_THROW_V  = 0.05;  // px/ms; below this, a release doesn't throw
+var CAROUSEL_STOP_V       = 0.015; // px/ms; momentum ends below this
+var CAROUSEL_IDLE_MS      = 60;    // held still this long before release ⇒ no throw
+
 // Hover indicator state
 var hover_zone = null;
 var hover_opacity = 0.0;
@@ -467,7 +479,37 @@ function create_thumbnails() {
     }
 }
 
+// Stop any in-flight carousel momentum.
+function carousel_stop_inertia() {
+    if (carousel_inertia_raf) { cancelAnimationFrame(carousel_inertia_raf); carousel_inertia_raf = 0; }
+    carousel_vel = 0;
+}
+
+// "Throw" the carousel: keep scrolling from the release velocity, decaying to a stop.
+function carousel_start_inertia() {
+    if (Math.abs(carousel_vel) < CAROUSEL_MIN_THROW_V) { carousel_vel = 0; return; }
+    var header = document.getElementById('header_container');
+    var vert = landscape_mq.matches;
+    var last = performance.now();
+    function step(now) {
+        var dt = now - last; last = now;
+        if (dt > 0) {
+            var max = vert ? header.scrollHeight - header.clientHeight
+                           : header.scrollWidth  - header.clientWidth;
+            var next = (vert ? header.scrollTop : header.scrollLeft) - carousel_vel * dt; // scroll moves opposite the pointer
+            if (next <= 0)        { next = 0;   carousel_vel = 0; }
+            else if (next >= max) { next = max; carousel_vel = 0; }
+            if (vert) header.scrollTop = next; else header.scrollLeft = next;
+            carousel_vel *= Math.exp(-dt / CAROUSEL_FRICTION_TAU);
+        }
+        if (Math.abs(carousel_vel) < CAROUSEL_STOP_V) { carousel_inertia_raf = 0; return; }
+        carousel_inertia_raf = requestAnimationFrame(step);
+    }
+    carousel_inertia_raf = requestAnimationFrame(step);
+}
+
 function scroll_carousel_to(index) {
+    carousel_stop_inertia();
     var header = document.getElementById('header_container');
     var hr   = header.getBoundingClientRect();
     var vert = landscape_mq.matches;
@@ -605,17 +647,31 @@ function refresh_hover() {
 // Drawing
 // ---------------------------------------------------------------------------
 
+// --- draw() per-frame telemetry (TEMP: confirm swipe-jank culprit) ---
+var dperf_n = 0, dperf_sum = 0, dperf_max = 0, dperf_t0 = 0;
+function draw_perf_reset() { dperf_n = 0; dperf_sum = 0; dperf_max = 0; dperf_t0 = performance.now(); }
+function draw_perf_report(tag) {
+    if (dperf_n === 0) return;
+    var dur = performance.now() - dperf_t0;
+    glimr_log('draw_perf', tag + ': ' + dperf_n + ' draws in ' + dur.toFixed(0) + 'ms (' +
+        (dperf_n / (dur / 1000)).toFixed(0) + '/s) · per-draw avg ' + (dperf_sum / dperf_n).toFixed(1) +
+        'ms, max ' + dperf_max.toFixed(1) + 'ms');
+}
+
 function draw(offset) {
     if (offset === undefined) offset = 0;
     if (current_index === null) return;
     current_draw_offset = offset;
 
+    var _t = performance.now();
     if (zoom_mode) {
         renderer.draw_zoomed(current_index, zoom_scale, zoom_pan_x, zoom_pan_y);
     } else {
         renderer.draw(current_index, offset);
     }
     renderer.draw_hover_indicator(current_index, hover_zone || '', hover_opacity);
+    _t = performance.now() - _t;
+    dperf_n++; dperf_sum += _t; if (_t > dperf_max) dperf_max = _t;
 }
 
 // ---------------------------------------------------------------------------
@@ -727,6 +783,7 @@ function animate_slide(from_offset, to_offset, on_complete) {
             animation_id = requestAnimationFrame(step);
         } else {
             animation_id = null;
+            draw_perf_report('drag+slide');   // TEMP telemetry
             if (on_complete) {
                 on_complete();
             } else {
@@ -746,6 +803,7 @@ function pointer_start(x, y) {
         cancelAnimationFrame(animation_id);
         animation_id = null;
     }
+    draw_perf_reset();
     is_dragging = true;
     drag_start_x = x;
     drag_start_y = y;
@@ -986,48 +1044,72 @@ function init() {
 
     var header = document.getElementById('header_container');
 
-    header.addEventListener('mousedown', function(e) {
+    // Unified pointer drag-to-scroll with kinetic "throw" (mouse + touch + pen).
+    // Pointer capture (taken lazily, only once it's a real drag — see pointermove) keeps the
+    // drag alive past the strip edges without retargeting a stationary click away from the
+    // thumbnail; touch-action:none (CSS) hands touch panning to us for consistent momentum.
+    header.addEventListener('pointerdown', function(e) {
+        var was_gliding = carousel_inertia_raf !== 0;
+        carousel_stop_inertia();
         carousel_is_dragging = true;
+        carousel_pointer_id = e.pointerId;
+        carousel_captured = false;
+        var vert = landscape_mq.matches;
         carousel_drag_start_x = e.clientX;
         carousel_drag_start_y = e.clientY;
-        carousel_scroll_start = landscape_mq.matches ? header.scrollTop : header.scrollLeft;
-        carousel_drag_moved = false;
+        carousel_scroll_start = vert ? header.scrollTop : header.scrollLeft;
+        carousel_last_pos = vert ? e.clientY : e.clientX;
+        carousel_last_t = performance.now();
+        carousel_vel = 0;
+        // A press that catches a moving carousel counts as a "move" so the tap stops it
+        // (catch) rather than selecting a thumbnail.
+        carousel_drag_moved = was_gliding;
     }, false);
-    header.addEventListener('mousemove', function(e) {
+    header.addEventListener('pointermove', function(e) {
+        if (!carousel_is_dragging || e.pointerId !== carousel_pointer_id) return;
+        var vert = landscape_mq.matches;
+        var d = vert ? e.clientY - carousel_drag_start_y : e.clientX - carousel_drag_start_x;
+        if (Math.abs(d) > 4) {
+            carousel_drag_moved = true;
+            if (!carousel_captured) { // capture only now → a non-moving click still selects
+                try { header.setPointerCapture(carousel_pointer_id); carousel_captured = true; } catch (_) {}
+            }
+        }
+        var pos = vert ? e.clientY : e.clientX;
+        var now = performance.now();
+        var dt = now - carousel_last_t;
+        if (dt > 100) carousel_vel = 0;                            // long gap → treat as paused
+        else if (dt > 0) carousel_vel = 0.8 * carousel_vel + 0.2 * (pos - carousel_last_pos) / dt;
+        carousel_last_pos = pos;
+        carousel_last_t = now;
+        if (vert) header.scrollTop  = carousel_scroll_start - d;
+        else      header.scrollLeft = carousel_scroll_start - d;
+    }, false);
+    function carousel_pointer_end() {
         if (!carousel_is_dragging) return;
-        var d = landscape_mq.matches
-            ? e.clientY - carousel_drag_start_y
-            : e.clientX - carousel_drag_start_x;
-        if (Math.abs(d) > 4) carousel_drag_moved = true;
-        if (landscape_mq.matches) header.scrollTop  = carousel_scroll_start - d;
-        else                       header.scrollLeft = carousel_scroll_start - d;
+        carousel_is_dragging = false;
+        if (carousel_captured && carousel_pointer_id !== null) {
+            try { header.releasePointerCapture(carousel_pointer_id); } catch (_) {}
+        }
+        carousel_captured = false;
+        carousel_pointer_id = null;
+        // Held still before release (no moves fired during the pause) ⇒ stale velocity; don't throw.
+        if (performance.now() - carousel_last_t > CAROUSEL_IDLE_MS) carousel_vel = 0;
+        if (carousel_drag_moved) carousel_start_inertia();         // throw only after a real drag
+    }
+    header.addEventListener('pointerup', carousel_pointer_end, false);
+    header.addEventListener('pointercancel', function() {
+        carousel_is_dragging = false;
+        carousel_captured = false;
+        carousel_pointer_id = null;
+        carousel_vel = 0;
     }, false);
-    header.addEventListener('mouseup',    function() { carousel_is_dragging = false; }, false);
-    header.addEventListener('mouseleave', function() { carousel_is_dragging = false; }, false);
     header.addEventListener('wheel', function(e) {
         e.preventDefault();
+        carousel_stop_inertia();
         if (landscape_mq.matches) header.scrollTop  += e.deltaY;
         else                       header.scrollLeft += e.deltaY;
     }, {passive: false});
-
-    header.addEventListener('touchstart', function(e) {
-        carousel_is_dragging = true;
-        carousel_drag_start_x = e.touches[0].clientX;
-        carousel_drag_start_y = e.touches[0].clientY;
-        carousel_scroll_start = landscape_mq.matches ? header.scrollTop : header.scrollLeft;
-        carousel_drag_moved = false;
-    }, false);
-    header.addEventListener('touchmove', function(e) {
-        if (!carousel_is_dragging) return;
-        var d = landscape_mq.matches
-            ? e.touches[0].clientY - carousel_drag_start_y
-            : e.touches[0].clientX - carousel_drag_start_x;
-        if (Math.abs(d) > 4) { carousel_drag_moved = true; e.preventDefault(); }
-        if (landscape_mq.matches) header.scrollTop  = carousel_scroll_start - d;
-        else                       header.scrollLeft = carousel_scroll_start - d;
-    }, {passive: false});
-    header.addEventListener('touchend',    function() { carousel_is_dragging = false; }, false);
-    header.addEventListener('touchcancel', function() { carousel_is_dragging = false; }, false);
 
     var last_landscape = landscape_mq.matches;
     window.addEventListener('resize', function() {

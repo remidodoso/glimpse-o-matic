@@ -102,11 +102,23 @@ fn get_2d_context(canvas: &HtmlCanvasElement) -> Result<CanvasRenderingContext2d
         .map_err(|_| JsValue::from_str("2d context is wrong type"))
 }
 
+fn new_canvas() -> Result<HtmlCanvasElement, JsValue> {
+    web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?
+        .document().ok_or_else(|| JsValue::from_str("no document"))?
+        .create_element("canvas")?
+        .dyn_into::<HtmlCanvasElement>()
+        .map_err(|_| JsValue::from_str("failed to create canvas"))
+}
+
 #[wasm_bindgen]
 pub struct GlimrRenderer {
     names:       Vec<String>,
     image_bytes: Vec<Vec<u8>>,                         // XOR-decoded JPEG/PNG bytes
-    pixel_cache: HashMap<usize, (u32, u32, Vec<u8>)>, // watermarked RGBA
+    pixel_cache: HashMap<usize, (u32, u32, Vec<u8>)>, // watermarked RGBA (full-res; download + zoom)
+    // Screen-size watermarked drawables for the swipe view, built once per image from
+    // pixel_cache. Keyed by index, lifetime-aligned with pixel_cache, flushed when the
+    // pane geometry changes (tracked via the backing canvas size in draw()).
+    scroll_cache: HashMap<usize, HtmlCanvasElement>,
     canvas:  HtmlCanvasElement,  // #photo
     backing: HtmlCanvasElement,  // #backing
     decode:  HtmlCanvasElement,  // hidden, used to scale-blit decoded images
@@ -131,6 +143,7 @@ impl GlimrRenderer {
             names:       Vec::new(),
             image_bytes: Vec::new(),
             pixel_cache: HashMap::new(),
+            scroll_cache: HashMap::new(),
             canvas,
             backing,
             decode,
@@ -148,6 +161,7 @@ impl GlimrRenderer {
         self.names.clear();
         self.image_bytes.clear();
         self.pixel_cache.clear();
+        self.scroll_cache.clear();
         self.stream_buf.clear();
         self.stream_state = StreamState::NeedHeader;
         self.stream_done  = false;
@@ -332,6 +346,43 @@ impl GlimrRenderer {
         let ms = js_sys::Date::now() - t0;
         glog("receive_pixels", &format!("image {} {}×{} watermarked in {:.0}ms", i, width, height, ms));
         self.pixel_cache.insert(i, (width, height, pixels));
+        // Build the screen-size swipe surface now, as a by-product (no extra watermarking).
+        // No-op until the pane has a known size (first draw); draw() rebuilds lazily after that.
+        let _ = self.build_scroll_surface(i);
+        Ok(())
+    }
+
+    /// Build (or refresh) the screen-size watermarked drawable for image `i` from its
+    /// full-res pixels, sized to fit the current pane (the backing-canvas geometry).
+    /// Cheap downscale of pixels we already watermarked — never triggers a new watermark.
+    fn build_scroll_surface(&mut self, i: usize) -> Result<(), JsValue> {
+        let pw = self.canvas.width();
+        let ph = self.canvas.height();
+        if pw == 0 || ph == 0 { return Ok(()); }                 // pane not laid out yet
+        let (img_w, img_h) = match self.pixel_cache.get(&i) {
+            Some(e) => (e.0, e.1),
+            None => return Ok(()),
+        };
+        let scale = f64::min(pw as f64 / img_w as f64, ph as f64 / img_h as f64);
+        let sw = ((img_w as f64 * scale).round() as u32).max(1);
+        let sh = ((img_h as f64 * scale).round() as u32).max(1);
+        if let Some(c) = self.scroll_cache.get(&i) {             // already current at this size
+            if c.width() == sw && c.height() == sh { return Ok(()); }
+        }
+        self.decode.set_width(img_w);
+        self.decode.set_height(img_h);
+        let dctx = get_2d_context(&self.decode)?;
+        {
+            let px = &self.pixel_cache[&i].2;
+            let img_data = ImageData::new_with_u8_clamped_array_and_sh(Clamped(px.as_slice()), img_w, img_h)?;
+            dctx.put_image_data(&img_data, 0.0, 0.0)?;
+        }
+        let surf = new_canvas()?;
+        surf.set_width(sw);
+        surf.set_height(sh);
+        get_2d_context(&surf)?.draw_image_with_html_canvas_element_and_dw_and_dh(
+            &self.decode, 0.0, 0.0, sw as f64, sh as f64)?;
+        self.scroll_cache.insert(i, surf);
         Ok(())
     }
 
@@ -355,6 +406,7 @@ impl GlimrRenderer {
                 Some(v) => {
                     if let Some((_, _, px)) = self.pixel_cache.remove(&v) {
                         total -= px.len();
+                        self.scroll_cache.remove(&v); // lifetime-aligned with the full-res entry
                     }
                 }
                 None => break, // only `current` remains
@@ -368,8 +420,18 @@ impl GlimrRenderer {
         let h = self.canvas.client_height() as u32;
         if w == 0 || h == 0 { return Ok(()); }
 
-        self.backing.set_width(w);
-        self.backing.set_height(h);
+        // Resize buffers only when the pane geometry actually changes — and when it does,
+        // flush the (now wrong-size) screen-size scroll surfaces so they rebuild for the new
+        // geometry. The backing-canvas size doubles as the "geometry the surfaces were built
+        // for" tracker.
+        if self.canvas.width() != w || self.canvas.height() != h {
+            self.backing.set_width(w);
+            self.backing.set_height(h);
+            self.canvas.set_width(w);
+            self.canvas.set_height(h);
+            self.scroll_cache.clear();
+        }
+
         let back_ctx = get_2d_context(&self.backing)?;
         back_ctx.set_fill_style_str("#777777");
         back_ctx.fill_rect(0.0, 0.0, w as f64, h as f64);
@@ -385,8 +447,6 @@ impl GlimrRenderer {
             self.draw_image_in_column(&back_ctx, index + 1, offset + wf, wf, hf)?;
         }
 
-        self.canvas.set_width(w);
-        self.canvas.set_height(h);
         get_2d_context(&self.canvas)?
             .draw_image_with_html_canvas_element(&self.backing, 0.0, 0.0)
             .map_err(|e| e)
@@ -488,6 +548,11 @@ impl GlimrRenderer {
             }
         };
 
+        // Blit the pre-scaled, screen-size watermarked surface (built once) — no per-frame
+        // full-res put_image_data. It's already at the fit-display size, so this is a plain
+        // translated blit; `offset` is carried by `col_x`.
+        self.build_scroll_surface(index)?; // cheap if already cached at the current geometry
+
         let iw = img_w as f64;
         let ih = img_h as f64;
         let scale = f64::min(col_w / iw, col_h / ih);
@@ -496,23 +561,12 @@ impl GlimrRenderer {
         let h_pad = (col_w - dst_w) / 2.0;
         let v_pad = (col_h - dst_h) / 2.0;
 
-        self.decode.set_width(img_w);
-        self.decode.set_height(img_h);
-        let decode_ctx = get_2d_context(&self.decode)?;
-
-        let img_data = {
-            let pixels = &self.pixel_cache[&index].2;
-            ImageData::new_with_u8_clamped_array_and_sh(Clamped(pixels.as_slice()), img_w, img_h)?
-        };
-        decode_ctx.put_image_data(&img_data, 0.0, 0.0)?;
-
-        ctx.draw_image_with_html_canvas_element_and_dw_and_dh(
-            &self.decode,
-            col_x + h_pad,
-            v_pad,
-            dst_w,
-            dst_h,
-        )
-        .map_err(|e| e)
+        if let Some(surf) = self.scroll_cache.get(&index) {
+            ctx.draw_image_with_html_canvas_element(surf, col_x + h_pad, v_pad).map_err(|e| e)
+        } else {
+            ctx.set_fill_style_str("#777777");
+            ctx.fill_rect(col_x, 0.0, col_w, col_h);
+            Ok(())
+        }
     }
 }
