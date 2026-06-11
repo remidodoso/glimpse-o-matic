@@ -20,7 +20,6 @@ export const glimrrenderer_is_stream_done: (a: number) => number;
 export const glimrrenderer_new: (a: any, b: any) => [number, number, number];
 export const glimrrenderer_receive_pixels: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number];
 export const glimrrenderer_watermarked_pixels: (a: number, b: number) => any;
-export const xor_decode: (a: number, b: number) => [number, number];
 export const __wbindgen_exn_store: (a: number) => void;
 export const __externref_table_alloc: () => number;
 export const __wbindgen_externrefs: WebAssembly.Table;

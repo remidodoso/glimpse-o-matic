@@ -63,11 +63,12 @@ fn is_reserved(name: &str) -> bool {
         "social_preview.png" | "social_preview.txt")
 }
 
-/// Exported for direct use where needed.
-#[wasm_bindgen]
-pub fn xor_decode(input: &[u8]) -> Vec<u8> {
-    xor_bytes(input)
-}
+// NOTE: not exported to JS. `xor_bytes` is used internally by the streaming zip parser
+// (`feed_bytes`) to de-obfuscate `.dat` entries. It was previously `#[wasm_bindgen] pub fn
+// xor_decode`, but an exported de-obfuscation primitive is a turnkey oracle — anyone could pull a
+// `.dat` from the Network tab and call it to recover the pristine original. Removing the export
+// forces a would-be deobfuscator to find the key in the WASM and reimplement XOR (more
+// inconvenience, which is the whole point of the obfuscation layer). Re-export if a tool ever needs it.
 
 // ---------------------------------------------------------------------------
 // Streaming zip parser state machine.
@@ -120,7 +121,11 @@ pub struct GlimrRenderer {
     // pane geometry changes (tracked via the backing canvas size in draw()).
     scroll_cache: HashMap<usize, HtmlCanvasElement>,
     canvas:  HtmlCanvasElement,  // #photo
-    backing: HtmlCanvasElement,  // #backing
+    // #backing — off-screen compose target: each frame composes the gray fill + columns here,
+    // then blits to #photo. INTENTIONAL — added in early prototyping to avoid flicker/glitching
+    // when compositing the swipe directly to the visible canvas. Keep it; don't "optimize" the
+    // indirection away without verifying the swipe stays glitch-free on real devices.
+    backing: HtmlCanvasElement,
     decode:  HtmlCanvasElement,  // hidden, used to scale-blit decoded images
     // Streaming zip parse state
     stream_buf:   Vec<u8>,

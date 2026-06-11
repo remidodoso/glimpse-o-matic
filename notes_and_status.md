@@ -29,18 +29,20 @@ A watermarked image distribution platform. Goals:
 
 Three-party model: **photographer** (IP holder), **model** (subject, controls distribution), **patron** (viewer). One zip per gallery — no per-audience variants. All copies watermarked; model-mode copies carry a distinct mark rather than being unmarked.
 
-### Watermarking — two-layer model
+### Watermarking — single-layer model
 
-**Pack-time (zip contents)**
-- Simple LSB mark baked into images at pack time
-- Identifies the gallery/distribution; erased by re-encoding — low bar, intentional
-- Provides minimal protection against direct zip extraction
+**View-time spread-spectrum DWT mark (the only watermark; applied by WASM)**
+- Frequency-domain watermark (CDF 5/3 DWT, spread-spectrum): robust, survives recompression/resizing/cropping/rescaling; 192-bit payload (128 data + 32 CRC-32 + 32 BCH parity). See the *Watermarking — Status Checkpoint* and *ECC* sections for the shipped detail.
+- Applied order: browser decode → spread-spectrum DWT mark (`receive_pixels` → `embed_y`) → blit to canvas
+- Image pixels stay in WASM linear memory after the mark is applied; only watermarked pixels are ever exported (download). (Caveat: the *un*-marked pixels/bytes briefly transit JS during browser JPEG decode — see *Security Model — Devtools Access*.)
 
-**View-time (primary, applied by WASM)**
-- Frequency-domain watermark (DCT/DWT spread-spectrum): robust, survives recompression/resizing, ~32–128 bit payload
-- LSB mark: high capacity, fragile; multiple redundant copies prefixed by magic number — reader tool scans without needing to know placement offsets
-- Applied order: decode → frequency-domain mark → LSB mark → blit to canvas
-- In WASM era: image data stays in WASM linear memory, never surfaced as JS `Image` objects or blob URLs
+> **Note — LSB stego (under consideration / further study, not shipped).** An earlier design imagined a
+> second, independent **LSB** layer (pack-time and/or view-time, redundant copies behind a magic number,
+> scanned by a reader tool). **No such code was ever shipped, and there is none in the tree** — the only
+> `LSB` references in `watermark.rs` are *amplitude units* (e.g. "max|Δ| 1.3 LSB"), not a stego layer.
+> It remains an attractive *future* idea: a cheap independent channel that survives lossless paths and
+> fails differently from the DWT mark — but it's fragile to any re-encode, so it would only ever be a
+> bonus oracle, never the primary mark. Revisit as its own study; do not treat it as planned work.
 
 ### Session data gathered for watermark payload
 
@@ -61,7 +63,7 @@ Active (permission requested): geolocation
 - **watermark-decode** (implemented): input suspected leaked image → blindly recovers the
   frequency-domain (DWT) payload — scale + crop offset auto-recovered, CRC verdict. Default is
   fully blind; `--size`/`--ref` fast overrides; `-v` verbose + live progress bar. See the
-  Watermarking checkpoint. (LSB magic-number scan still TODO once the LSB layer ships.)
+  Watermarking checkpoint. (No LSB layer exists; that idea is parked under "further study" — see the single-layer model note above.)
 - Future: `gallery-config.toml` output from packg, read by WASM build step to bake constants
 
 ---
@@ -184,21 +186,38 @@ root; just ensure no-store / no-cache during development so WASM/JS edits aren't
 
 ---
 
-## Rust/WASM Migration Plan
+## Rust/WASM Migration ("rustification") — complete
 
-Goal: incrementally replace JS with Rust/WASM, keeping a working app at every step.
+Original goal: incrementally replace JS with Rust/WASM, keeping a working app at every step, with the
+end state being "everything in WASM, JS as bootstrap only." **That end state was deliberately revised**
+— see Phases 3–4 below. The migration is now considered **complete**: everything that *should* be in
+Rust is, by the boundary criteria below.
+
+**Boundary criteria (the rule we settled on):** port to Rust/WASM only when it (a) runs *faster* in
+WASM, or (b) keeps *unmarked* data out of easy JS reach. Use the browser's optimized codecs where only
+*marked* data crosses the boundary. Leave UI/event/orchestration code in JS when moving it would be more
+code for no speed. Net boundary: **JS = UI, events, gestures, orchestration, browser codecs; Rust =
+pixels, zip parsing, rendering, caching.**
 
 ### Phase 1 — Image processing + zip handling in WASM ✓
 XOR decode + zip parsing in WASM. `GlimrZip` struct (now removed). Single JS/WASM boundary crossing per archive. fflate CDN eliminated.
 
-### Phase 2 — Canvas rendering in WASM (in progress, steps 1–7 done)
-`draw()`, `draw_zoomed()`, `draw_image_in_column()` in WASM via `web-sys` canvas bindings. Decoded image bytes stay in WASM linear memory. JS still handles events.
+### Phase 2 — Canvas rendering in WASM ✓
+`draw()`, `draw_zoomed()`, `draw_image_in_column()` in WASM via `web-sys` canvas bindings. Decoded image pixels stay in WASM linear memory; per-frame blit runs off the screen-size scroll cache. JS handles events.
 
-### Phase 3 — State and event handling in WASM
-Move state machine (current_index, zoom state, drag state, animation loops) to WASM. JS event listeners become thin wrappers.
+### Phases 3–4 — State + event handling, bootstrap-only JS — SUPERSEDED (won't-do, by design)
+*Original goal:* move the state machine (current_index, zoom/drag state, animation loops) and all event
+handling into WASM; reduce JS to load-module + file-picker + `fetch` + `requestFullscreen`.
 
-### Phase 4 — Bootstrap only in JS
-JS handles only: load WASM module, file picker, `fetch`, `requestFullscreen`. Everything else is WASM.
+*What we actually did, and why:* we **stopped here on purpose.** The remaining JS — pointer/touch/pinch
+handling, zoom/pan/carousel-momentum geometry, the rAF animation loops — is pure orchestration with no
+perf hotspot (every per-frame cost already lands in Rust via the `draw*` calls and the scroll-cache
+blit) and no unmarked-data exposure to fix. By criterion (c) above, porting it would be **more code for
+zero speed**, so Phases 3–4 are won't-do, not unfinished.
+
+*Known caveat (not a gap to close for the MVP):* the browser JPEG **decode** path still passes unmarked
+bytes/pixels through JS — a deliberate speed-vs-inconvenience trade. See *Security Model — Devtools
+Access* and the `mozjpeg-sys` TODO for the trigger to revisit.
 
 ---
 
@@ -742,7 +761,11 @@ Display order = zip entry order (no sort). `packg` writes entries in hash-sorted
 
 ### Security Model — Devtools Access
 
-**Goal**: "Security by moderate inconvenience."
+**Goal**: "Security by moderate inconvenience." The mark exists to **capture downloaders and
+screenshotters** — the casual re-sharer. Someone with the facility to *bypass* a watermarking
+scheme (reads the source, sets breakpoints, scrapes WASM memory, strips the mark) is **explicitly
+not an adversary we are trying to defeat**. So the design optimizes a two-axis tradeoff —
+**speed** vs **inconvenience** — and deliberately does not chase a hard wall.
 
 - **Network tab**: `.dat` XOR encoding — no raw JPEG in transit
 - **Canvas (`#photo`)**: watermarked version only — acceptable
@@ -751,8 +774,9 @@ Display order = zip entry order (no sort). `packg` writes entries in hash-sorted
 - **`decode` canvas**: created programmatically, never appended to DOM — not visible in element inspector
 - **`#backing`**: has `hidden` attribute but still in DOM — minor gap; TODO: create programmatically
 - **WASM linear memory**: `pixel_cache` raw RGBA — inspectable only by knowing byte offset
-- **Hybrid decode weakness**: un-watermarked RGBA briefly exists as JS `ImageData` during `getImageData` → `receive_pixels`. Acceptable at current security model. Thumbnail canvases hold un-watermarked pixels at thumbnail resolution — also acceptable.
-- **mozjpeg-sys path**: would keep decode entirely in WASM; revisit if security model tightens
+- **Hybrid decode weakness**: un-watermarked RGBA briefly exists as JS `ImageData` during `getImageData` → `receive_pixels`, and `get_image_bytes(i)` hands JS the **raw de-obfuscated original JPEG** (the bytes must reach `createImageBitmap`). Thumbnail canvases also hold un-watermarked pixels at thumbnail resolution. **All reachable only by reading the source + setting a breakpoint** (or calling the named accessor) — *not* by right-click-save or a casual canvas poke. That "had to study the code first" bar matches the threat model, so it's **accepted for the MVP**.
+- **Binary, not incremental**: while browser decode is used, the clean bytes/pixels *must* pass through JS, so half-measures (renaming/hiding `get_image_bytes`) don't lower the bar once someone's in devtools. You can't get *below* the "read-the-code" bar without moving JPEG **decode** into WASM. Don't burn effort on cosmetic in-between steps.
+- **mozjpeg-sys path (decode-in-WASM)**: the only way to keep unmarked bytes/pixels entirely out of JS. **It's a security trade that costs speed, not a perf win** — libjpeg-turbo's hand-written SIMD asm doesn't survive the WASM port, and the browser's native codec (full-width SIMD, threads, sometimes HW, outside the sandbox) will still lead by ~2–4×. Pure-Rust crates (`zune-jpeg`) were worse (~400ms/img w/ SIMD vs ~5–30ms native). **Natural trigger to revisit: when server-side identity (Workers + D1) lands and a recovered mark maps to a *named viewer*** — the unmarked original is worth more then, justifying the C toolchain. (Encode stays in the browser regardless — it operates on already-marked pixels, so it leaks nothing.)
 
 ---
 
@@ -996,8 +1020,8 @@ The ±1 pre-watermarking works well — scrolling to a neighbour is usually dela
   q0.92 JPEG blob (same encode as download) instead of evicting RGBA; ~10× smaller, fast
   decode-on-draw, fits a whole large catalog. Would largely retire the byte budget. See
   *Background Pre-Watermarking & Cache Memory* §3.
-- **Step 8 — LSB watermark stub**: In `receive_pixels`, write `"GLIM"` magic + 28 zero payload bytes into RGBA LSBs. Structured for `read-watermark` tool.
-- **mozjpeg-sys**: If security model tightens (pixels must not pass through JS), revisit C build toolchain (NASM + CMake + clang wasm32 target) on Windows.
+- **LSB stego layer — UNDER CONSIDERATION / FURTHER STUDY** (not planned work): a second, independent LSB channel (e.g. `"GLIM"` magic + payload in RGBA LSBs, redundant copies, scanned by a reader tool). Bonus oracle only — fragile to re-encode, never the primary mark. See the single-layer-model note for rationale. No code exists today.
+- **mozjpeg-sys (decode-in-WASM)**: If the security model tightens — i.e. when **server-side identity (Workers + D1)** makes a recovered mark map to a *named viewer* — revisit the C build toolchain (NASM + CMake + clang wasm32 target on Windows) to keep unmarked bytes/pixels out of JS entirely. **Costs speed (browser native stays ~2–4× faster even vs mozjpeg-in-WASM), buys inconvenience** — a deliberate point on the speed↔inconvenience tradeoff, not a perf improvement. Not an MVP requirement; current exposure sits at the "read source + breakpoint" bar. See *Security Model — Devtools Access*.
 - **Rayon parallelism**: `wasm-bindgen-rayon` + `coi-serviceworker`. Less critical now; revisit when `receive_pixels` applies a real watermark algorithm.
 - **Move `#backing` off DOM**: create programmatically like `decode` canvas — minor security cleanup.
 - **Cache-busting for assets**: short TTL on `index.html`, longer on WASM/JS. Purge via `cloudflare::purge_cache` — uncomment in `main.rs` once API token has Zone:Cache Purge scope.

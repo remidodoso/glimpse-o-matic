@@ -647,31 +647,17 @@ function refresh_hover() {
 // Drawing
 // ---------------------------------------------------------------------------
 
-// --- draw() per-frame telemetry (TEMP: confirm swipe-jank culprit) ---
-var dperf_n = 0, dperf_sum = 0, dperf_max = 0, dperf_t0 = 0;
-function draw_perf_reset() { dperf_n = 0; dperf_sum = 0; dperf_max = 0; dperf_t0 = performance.now(); }
-function draw_perf_report(tag) {
-    if (dperf_n === 0) return;
-    var dur = performance.now() - dperf_t0;
-    glimr_log('draw_perf', tag + ': ' + dperf_n + ' draws in ' + dur.toFixed(0) + 'ms (' +
-        (dperf_n / (dur / 1000)).toFixed(0) + '/s) · per-draw avg ' + (dperf_sum / dperf_n).toFixed(1) +
-        'ms, max ' + dperf_max.toFixed(1) + 'ms');
-}
-
 function draw(offset) {
     if (offset === undefined) offset = 0;
     if (current_index === null) return;
     current_draw_offset = offset;
 
-    var _t = performance.now();
     if (zoom_mode) {
         renderer.draw_zoomed(current_index, zoom_scale, zoom_pan_x, zoom_pan_y);
     } else {
         renderer.draw(current_index, offset);
     }
     renderer.draw_hover_indicator(current_index, hover_zone || '', hover_opacity);
-    _t = performance.now() - _t;
-    dperf_n++; dperf_sum += _t; if (_t > dperf_max) dperf_max = _t;
 }
 
 // ---------------------------------------------------------------------------
@@ -783,7 +769,6 @@ function animate_slide(from_offset, to_offset, on_complete) {
             animation_id = requestAnimationFrame(step);
         } else {
             animation_id = null;
-            draw_perf_report('drag+slide');   // TEMP telemetry
             if (on_complete) {
                 on_complete();
             } else {
@@ -803,7 +788,6 @@ function pointer_start(x, y) {
         cancelAnimationFrame(animation_id);
         animation_id = null;
     }
-    draw_perf_reset();
     is_dragging = true;
     drag_start_x = x;
     drag_start_y = y;

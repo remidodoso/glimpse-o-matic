@@ -72,11 +72,6 @@ export class GlimrRenderer {
  */
 export function glimr_log(func: string, msg: string): void;
 
-/**
- * Exported for direct use where needed.
- */
-export function xor_decode(input: Uint8Array): Uint8Array;
-
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
@@ -100,7 +95,6 @@ export interface InitOutput {
     readonly glimrrenderer_new: (a: any, b: any) => [number, number, number];
     readonly glimrrenderer_receive_pixels: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number];
     readonly glimrrenderer_watermarked_pixels: (a: number, b: number) => any;
-    readonly xor_decode: (a: number, b: number) => [number, number];
     readonly __wbindgen_exn_store: (a: number) => void;
     readonly __externref_table_alloc: () => number;
     readonly __wbindgen_externrefs: WebAssembly.Table;
