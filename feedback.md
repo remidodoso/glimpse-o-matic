@@ -363,3 +363,83 @@ treatment; emitters shouldn't care — they just write full-res PNGs + stdout nu
    is white-paper figure material regardless of outcome.
 6. **3.4** (orthogonal codes) — gated on its margin-histogram diagnostic, and best
    bundled with any 9/7 generation bump rather than done alone.
+
+---
+
+## 9. Response from the pair-programming session (2026-06-11)
+
+Thanks — this was a strong, correctly-scoped review and almost all of it was actionable.
+Below: what we measured, what shipped, and what we deliberately deferred. The human's standing
+calls going in: **no 9/7 wavelet change** (the binding constraint is embed time — ~2× DWT on an
+encode already at the "don't make it slower" line, not fp precision), **WebP coverage deferred**
+(JPEG is the dominant casual channel), and **rebuild/decodability cost is a non-issue** at the
+current micro-deployment scale.
+
+### What we built (all landed in `glimr/src/watermark.rs`)
+
+- **§6.1 progress bug — fixed.** The coarse loop now reports `Progress::Candidate { rank, total }`
+  as the 1-based position *within the current pyramid tier* (was `tried.len()/tried.len()`, always
+  equal). Verbose/CLI output now reads a meaningful "C2/5".
+- **3.1 full-accumulation fold — shipped.** `fold_tile` now accumulates *every* pixel into
+  `(y%FOLD, x%FOLD)` instead of truncating to whole-FOLD multiples. Harmless (see finding below).
+- **3.3 sub-bin peak — measured and ADOPTED into production.** New `scale_peaks_subbin` (3-point
+  parabolic vertex on the whitened-autocorr profile) is now what `decode_blind_auto_cb` uses for
+  candidate generation (both pyramid tiers).
+- **3.2 Chase decoding — measured and IMPLEMENTED.** New `decode_bits_chase(corr)`: tries the hard
+  decision first (zero cost when it verifies), else flips subsets of the `CHASE_K=12` least-confident
+  bits, ordered by ascending summed flipped-confidence, accepting the first CRC-verified codeword
+  (BCH still mops up the remaining ≤t per trial). Wired into **both** decode paths: the matched
+  `decode_y_at_size_verbose`, and the blind path as a **single last-resort rescue on the
+  most-prominent candidate** (`best`) — so the common clean path and all the noise candidates never
+  trigger the 4095-trial search. `register_decode` now returns the per-bit `corr` so `best` carries
+  it for that final pass. New `Progress::Chase { verified, errors }` event; the sweep and the CLI
+  render it (sweep "Chase" path tag + "needed Chase" stat).
+- **Diagnostics added** (`#[ignore]`, release, → `tests/reports/`): `cliff_error_profile`,
+  `subbin_precision`, `source_size_floor`. Plus a pub `decode_corr_at` helper (decode at a known
+  scale returning per-bit signed correlations; crop offset registered internally).
+
+### What we found
+
+- **3.2 — the cliff is noise-limited, errors cluster in the least-confident bits → Chase is justified.**
+  Decoding at known-true scale through a casual channel ladder (`cliff_error_profile.md`): at the
+  recoverable margin (q70/0.80/5% = 3 errs, q40/0.60/12% = 8 errs) the error bits sit almost entirely
+  in the bottom confidence ranks (q40/0.60/12%: 6 of 8 within the least-confident 16, median rank 9).
+  The catastrophic case (q40/0.50/15% = 33 errs) spreads (median rank 32) and is unrecoverable
+  regardless — correctly outside Chase's reach. So Chase converts the *just-past-budget* cliff, which
+  is exactly what it's wired to do.
+- **3.3 — sub-bin roughly halves worst-case scale error, stays inside the notch** (`subbin_precision.md`):
+  e.g. s=1.49 0.115%→0.049%, s=0.80 0.098%→0.038%, s=0.95 0.082%→0.036%; exact-multiple scales were
+  already 0. Worst case drops from ~0.12% (integer, drifting toward the 0.4% quantization) to ~0.05%,
+  comfortably under the <0.25% matched notch — hence the adoption.
+- **3.1 — the size floor is FINDER-limited, not reader-limited (your model of 3.1's locus was
+  slightly off, and the measurement is the interesting part).** `source_size_floor.md`: the **matched**
+  reference (known scale) verifies *cleanly down to 512 px* — the signal is present far below the
+  blind floor — while the **blind** path is intermittent below 1024 (1024 ✓, then 960/896/832/768/704
+  ✗, but 640/576 ✓ again). That non-monotone pattern is the scale *finder* harmonic-mislocking at
+  certain sizes, not the reader running out of signal. So full-accumulation fold (3.1) is harmless and
+  does give the reader more SNR, but it can't move the blind floor on its own because the reader isn't
+  the bottleneck. **The real size-floor lever is finder reliability / harmonic disambiguation** —
+  3.3's sub-bin feeds finder *precision*, but the *which-harmonic* question (why 640/576 lock but
+  896/832/768 don't) is a separate small investigation we've flagged, not closed.
+
+### Deferred / not done, and why
+
+- **3.4 orthogonal (Hadamard×scrambler) codes** — not done. It's a channel break, so per your §4.3 it
+  should bundle with any other generation bump; with 9/7 off the table for now there's nothing to
+  bundle it with. Also (our caveat from the discussion): the 21% self-noise figure is the *aligned*
+  best case — its real benefit degrades with sub-pixel registration residual, worst exactly at the
+  cliff, so its margin-histogram diagnostic must be run *post-registration on real channel cells*, not
+  at synthetic perfect alignment, before committing. Parked.
+- **3.5 subband MRC** — not done (minor expected win; revisit if the cliff still bites after Chase).
+- **§4 wavelet / §5 WebP & other channels** — deferred per the human's calls above. The rotation
+  lattice-peak note and photo-of-screen probe remain good "someday" items.
+- **§6.2/6.3/6.4** (Demo.zip size, sweep long tail, stale notes numbers) — acknowledged; Demo.zip is a
+  needed startup fixture so it stays.
+
+### Regression / improvement
+
+`blind_auto_sweep` re-run in release after all changes: **52/53 CRC-verified** (up from the 51/53
+baseline), median 3.0 s, max 53.0 s, no false-accepts (the in-sweep `assert_eq!(crop_errs, 0)` held).
+The newly-recovered cell — `riley q50 s=0.60` — was a **Chase rescue**: the finder locked the scale
+(prominence 2.0) but the hard decision failed; Chase flipped least-confident bits, BCH then fixed 4,
+CRC verified. That's the soft-decision lever working precisely as designed, on a real sweep cell.

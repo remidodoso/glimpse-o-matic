@@ -566,6 +566,53 @@ fn decode_bits(bits: &[bool; PAYLOAD_BITS]) -> Decoded {
     raw
 }
 
+/// How many least-confident bits Chase decoding is allowed to flip subsets of.
+/// 2^12−1 = 4095 trials, each a (cheap) BCH+CRC decode; only spent on a hard-decision
+/// *failure* at a plausibly-correct candidate, and only offline.
+const CHASE_K: usize = 12;
+
+/// Soft-decision (Chase-style) decode.  `corr` is the per-bit *signed* correlation —
+/// its sign is the hard bit decision, `|corr|` the confidence.  Tries the hard-decision
+/// codeword first (the common path: when it already verifies, this costs exactly one
+/// `decode_bits` and returns).  On failure, the cliff's bit errors concentrate in the
+/// least-confident bits (measured — see `cliff_error_profile.md`), so we flip subsets of
+/// the `CHASE_K` least-confident bits — ordered by ascending total flipped-confidence, so
+/// the most plausible candidate codewords are tried first — and accept the first that
+/// CRC-verifies (BCH still cleans up the remaining ≤t errors within each trial).  CRC
+/// stays the sole oracle: false-accept ≈ 2⁻³² per trial × 4095 trials is still negligible.
+/// Falls back to the hard-decision `Decoded` if nothing verifies.
+fn decode_bits_chase(corr: &[f32; PAYLOAD_BITS]) -> Decoded {
+    let mut bits = [false; PAYLOAD_BITS];
+    for (i, b) in bits.iter_mut().enumerate() { *b = corr[i] > 0.0; }
+    let hard = decode_bits(&bits);
+    if hard.verified { return hard; }
+
+    // The CHASE_K least-confident bit positions (ascending |corr|).
+    let mut idx: Vec<usize> = (0..PAYLOAD_BITS).collect();
+    idx.sort_by(|&a, &b| corr[a].abs().partial_cmp(&corr[b].abs()).unwrap());
+    idx.truncate(CHASE_K);
+
+    // All non-empty flip subsets of those bits, ordered most-plausible (lowest summed
+    // flipped-confidence) first.
+    let mut patterns: Vec<(f32, u32)> = (1u32..(1u32 << CHASE_K)).map(|mask| {
+        let cost: f32 = idx.iter().enumerate()
+            .filter(|(j, _)| mask & (1 << j) != 0)
+            .map(|(_, &bi)| corr[bi].abs()).sum();
+        (cost, mask)
+    }).collect();
+    patterns.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+    for (_, mask) in patterns {
+        let mut trial = bits;
+        for (j, &bi) in idx.iter().enumerate() {
+            if mask & (1 << j) != 0 { trial[bi] = !trial[bi]; }
+        }
+        let d = decode_bits(&trial);
+        if d.verified { return d; }
+    }
+    hard
+}
+
 // ── Subband embed / decode ────────────────────────────────────────────────────
 //
 // Embedding: for each bit b with sign s_b = ±1, every coefficient at subband
@@ -875,9 +922,9 @@ pub fn decode_y_at_size_verbose(
     let regridded = resample_y(y, width, height, orig_w, orig_h);
     let total = correlate_embed_levels(&regridded, orig_w, orig_h);
     let score: f32 = total.iter().map(|v| v.abs()).sum();
-    let mut bits = [false; PAYLOAD_BITS];
-    for (i, b) in bits.iter_mut().enumerate() { *b = total[i] > 0.0; }
-    (decode_bits(&bits), score)
+    // Chase tries the hard decision first (instant when it verifies); soft-decision flips
+    // only kick in on failure, where they recover the margin past the t=4 ECC budget.
+    (decode_bits_chase(&total), score)
 }
 
 // ── Debug / visual verification ──────────────────────────────────────────────
@@ -1028,6 +1075,39 @@ pub mod registration {
         peaks
     }
 
+    /// Like [`scale_peaks`] but each peak's lag is refined to sub-bin precision by a
+    /// 3-point parabolic fit through the whitened-autocorrelation profile around the
+    /// integer peak (vertex of the quadratic through `prof[lag-1..=lag+1]`). The integer
+    /// autocorr lag is quantized to ~0.4% at period 256, while the matched-decode notch
+    /// is <0.25% wide; interpolation recovers ~10× finer scale estimates essentially
+    /// free (whitening pre-sharpens the peak, so the parabola is well-behaved). Returns
+    /// `(refined_lag, value)` strongest-first. Falls back to the integer lag at a flat or
+    /// boundary peak.
+    pub fn scale_peaks_subbin(y: &[f32], w: usize, h: usize, top_k: usize) -> Vec<(f32, f32)> {
+        let mut planner = FftPlanner::<f32>::new();
+        let sb = SCALE_BLOCK.min(w).min(h);
+        let blk = extract(y, w, (w - sb) / 2, (h - sb) / 2, sb);
+        let ac = autocorr_whitened(&blk, sb, &mut planner);
+        let n = 2 * sb;
+        let c = sb;
+        let (min_lag, max_lag) = (24usize, sb - 2);
+        let prof: Vec<f32> = (0..max_lag)
+            .map(|lag| if lag < min_lag { f32::MIN } else { ac[c * n + c + lag].max(ac[(c + lag) * n + c]) })
+            .collect();
+        let mut peaks: Vec<(f32, f32)> = ((min_lag + 1)..(max_lag - 1))
+            .filter(|&lag| prof[lag] >= prof[lag - 1] && prof[lag] >= prof[lag + 1])
+            .map(|lag| {
+                let (ym1, y0, yp1) = (prof[lag - 1], prof[lag], prof[lag + 1]);
+                let denom = ym1 - 2.0 * y0 + yp1; // <0 at a maximum
+                let frac = if denom.abs() > 1e-12 { (0.5 * (ym1 - yp1) / denom).clamp(-0.5, 0.5) } else { 0.0 };
+                (lag as f32 + frac, y0)
+            })
+            .collect();
+        peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        peaks.truncate(top_k);
+        peaks
+    }
+
     /// Per-bit spatial templates: pn_b tiled into the embed bands (LH/HL at
     /// EMBED_LEVELS), inverse-DWT, one FOLD×FOLD interior tile.  Payload-independent
     /// references; the secret key (WM_KEY via pn_tile) is what makes them keyed.
@@ -1065,11 +1145,18 @@ pub mod registration {
         out
     }
 
-    /// Fold an image into one FOLD×FOLD tile by summing all whole period-FOLD shifts.
+    /// Fold an image into one FOLD×FOLD tile by summing every period-FOLD shift.
+    /// Accumulates **all** pixels — each (y,x) lands in `(y%FOLD, x%FOLD)`, including the
+    /// partial periods past the last whole FOLD multiple. The previous version truncated
+    /// to `(w/FOLD)*FOLD` and discarded those edges (up to ~FOLD−1 px per axis ⇒ a large
+    /// fraction of a small or non-multiple suspect — e.g. ~33% of a 768-px fold target).
+    /// Full accumulation buys that area back as decode SNR. Fold positions then carry
+    /// unequal accumulation counts (differing by at most 1 across the tile), a mild
+    /// non-uniform weighting the matched filter tolerates — the correlation-peak
+    /// *location* is unchanged; only the noise becomes slightly non-uniform.
     fn fold_tile(img: &[f32], w: usize, h: usize) -> Vec<f32> {
         let mut f = vec![0.0f32; FOLD * FOLD];
-        let (tw, th) = ((w / FOLD) * FOLD, (h / FOLD) * FOLD);
-        for y in 0..th { for x in 0..tw { f[(y % FOLD) * FOLD + (x % FOLD)] += img[y * w + x]; } }
+        for y in 0..h { for x in 0..w { f[(y % FOLD) * FOLD + (x % FOLD)] += img[y * w + x]; } }
         f
     }
 
@@ -1078,7 +1165,7 @@ pub mod registration {
     fn register_decode(
         suspect: &[f32], nw: usize, nh: usize, tw: usize, th: usize,
         tfft: &[Vec<Complex<f32>>], planner: &mut FftPlanner<f32>,
-    ) -> (Decoded, f32, usize, usize) {
+    ) -> (Decoded, f32, usize, usize, [f32; PAYLOAD_BITS]) {
         let rescaled = resample_y(suspect, nw, nh, tw, th);
         let band = keep_embed_bands(&rescaled, tw, th);
         let folded = fold_tile(&band, tw, th);
@@ -1100,8 +1187,53 @@ pub mod registration {
         for (i, &v) in score.iter().enumerate() { if v > bv { bv = v; bp = i; } }
         let smed = { let mut s = score.clone(); s.sort_by(|a, b| a.partial_cmp(b).unwrap()); s[s.len() / 2].max(1e-6) };
         let mut bits = [false; PAYLOAD_BITS];
-        for (b, m) in maps.iter().enumerate() { bits[b] = m[bp] > 0.0; }
-        (decode_bits(&bits), bv / smed, bp % FOLD, bp / FOLD)
+        let mut corr = [0.0f32; PAYLOAD_BITS]; // per-bit signed correlation, for soft-decision rescue
+        for (b, m) in maps.iter().enumerate() { corr[b] = m[bp]; bits[b] = m[bp] > 0.0; }
+        (decode_bits(&bits), bv / smed, bp % FOLD, bp / FOLD, corr)
+    }
+
+    /// Diagnostic sibling of [`register_decode`]: decode at a *known* rescale target and
+    /// return, alongside the `Decoded`, the per-bit **signed correlation at the registered
+    /// fold offset** — the confidence each sign decision rides on (`corr[b] = maps[b][bp]`).
+    /// The crop offset is absorbed by the internal score-peak search, so this works on
+    /// cropped suspects too. Used to study where pre-ECC bit errors fall vs confidence
+    /// (the soft-decision / Chase question). Builds template FFTs per call (~0.5 s) from
+    /// the cached templates — fine for the handful of calls a diagnostic makes.
+    pub fn decode_corr_at(
+        suspect: &[f32], nw: usize, nh: usize, tw: usize, th: usize,
+    ) -> (Decoded, [f32; PAYLOAD_BITS]) {
+        use std::sync::OnceLock;
+        static TEMPLATES: OnceLock<Vec<Vec<f32>>> = OnceLock::new();
+        let templates = TEMPLATES.get_or_init(bit_templates);
+        let mut planner = FftPlanner::<f32>::new();
+        let tfft: Vec<Vec<Complex<f32>>> = templates.iter().map(|t| {
+            let mut f: Vec<Complex<f32>> = t.iter().map(|&v| Complex::new(v, 0.0)).collect();
+            fft_2d(&mut f, FOLD, &mut planner, false);
+            f
+        }).collect();
+
+        let rescaled = resample_y(suspect, nw, nh, tw, th);
+        let band = keep_embed_bands(&rescaled, tw, th);
+        let folded = fold_tile(&band, tw, th);
+        let mut ff: Vec<Complex<f32>> = folded.iter().map(|&v| Complex::new(v, 0.0)).collect();
+        fft_2d(&mut ff, FOLD, &mut planner, false);
+
+        let mut score = vec![0.0f32; FOLD * FOLD];
+        let mut maps: Vec<Vec<f32>> = Vec::with_capacity(tfft.len());
+        let norm = (FOLD * FOLD) as f32;
+        for tf in &tfft {
+            let mut prod: Vec<Complex<f32>> = ff.iter().zip(tf.iter()).map(|(a, b)| *a * b.conj()).collect();
+            fft_2d(&mut prod, FOLD, &mut planner, true);
+            let cc: Vec<f32> = prod.iter().map(|z| z.re / norm).collect();
+            for (s, v) in score.iter_mut().zip(cc.iter()) { *s += v.abs(); }
+            maps.push(cc);
+        }
+        let (mut bp, mut bv) = (0usize, f32::MIN);
+        for (i, &v) in score.iter().enumerate() { if v > bv { bv = v; bp = i; } }
+        let mut bits = [false; PAYLOAD_BITS];
+        let mut corr = [0.0f32; PAYLOAD_BITS];
+        for (b, m) in maps.iter().enumerate() { corr[b] = m[bp]; bits[b] = m[bp] > 0.0; }
+        (decode_bits(&bits), corr)
     }
 
     /// Progress events emitted during a blind decode, for an optional UI.  The
@@ -1109,10 +1241,14 @@ pub mod registration {
     /// it likes (a one-line bar, verbose log, or ignores them).
     pub enum Progress {
         Phase(&'static str), // "building templates", "estimating scale", "refining…"
-        /// A coarse scale candidate, tried strongest-autocorr-first (rank 1 = strongest).
+        /// A coarse scale candidate. `rank`/`total` are the 1-based position within the
+        /// current pyramid tier's candidate list (strongest-autocorr-first), e.g. 2/5.
         Candidate { rank: usize, total: usize, scale: f32, strength: f32, prominence: f32, verified: bool, errors: u8 },
         /// A fine ±refinement attempt (only reached when no coarse candidate verified).
         Refine { candidate: usize, scale: f32, prominence: f32, verified: bool, errors: u8 },
+        /// The soft-decision (Chase) rescue on the most-prominent candidate — a last resort
+        /// reached only when no hard-decision candidate verified.
+        Chase { verified: bool, errors: u8 },
     }
 
     /// Blindly recover scale + crop offset and decode the payload from a suspect Y
@@ -1159,21 +1295,26 @@ pub mod registration {
         let min_scale = if max_source > 0 { w.max(h) as f32 / max_source as f32 } else { 0.1 };
         let max_scale = (w.max(h) as f32 / MIN_SOURCE as f32).min(4.0);
 
+        // best = (decoded, prominence, offset, scale, per-bit corr) — the corr rides along
+        // so the most-prominent candidate can be Chase-rescued at the end without re-running.
         let mut best = (Decoded { data: [0u8; DATA_BYTES], verified: false, errors_corrected: 0 },
-                        f32::MIN, (0usize, 0usize), 1.0f32);
+                        f32::MIN, (0usize, 0usize), 1.0f32, [0.0f32; PAYLOAD_BITS]);
         let mut tried: Vec<f32> = Vec::new();          // scales tried (dedup across pyramid tiers)
         let mut coarse: Vec<(f32, f32)> = Vec::new();  // (prominence, scale) for refine ranking
 
         for &d in &[1.0f32, 0.5, 0.25] {
             let (dw, dh) = if d == 1.0 { (w, h) } else { ((w as f32 * d) as usize, (h as f32 * d) as usize) };
             if d != 1.0 && dw.min(dh) < PYRAMID_MIN_DIM { continue; } // too small to find a period
-            let peaks = if d == 1.0 { scale_peaks(y, w, h, CANDIDATES) }
-                        else { let dy = resample_y(y, w, h, dw, dh); scale_peaks(&dy, dw, dh, CANDIDATES) };
+            // Sub-bin (parabolic) peak refinement: the interpolated lag lands candidates in
+            // the <0.25% matched notch that the ~0.4%-quantized integer lag would miss
+            // (measured in subbin_precision.md), so fewer refine rungs are needed.
+            let peaks = if d == 1.0 { scale_peaks_subbin(y, w, h, CANDIDATES) }
+                        else { let dy = resample_y(y, w, h, dw, dh); scale_peaks_subbin(&dy, dw, dh, CANDIDATES) };
 
             // Expand this tier's peaks into new, bounded, deduped candidate scales.
             let mut tier: Vec<(f32, f32)> = Vec::new(); // (scale, strength)
             for (lag, strength) in peaks {
-                let s0 = lag as f32 / (d * SCALE_REF as f32);
+                let s0 = lag / (d * SCALE_REF as f32);
                 for div in [1.0f32, 2.0, 3.0] {
                     let s = (s0 / div).clamp(0.1, 4.0);
                     if s < min_scale || s > max_scale { continue; }
@@ -1183,18 +1324,19 @@ pub mod registration {
             }
 
             // Coarse pass over this tier; first CRC/ECC-verified decode wins.
-            for (s, strength) in tier {
+            let tier_total = tier.len();
+            for (ti, (s, strength)) in tier.into_iter().enumerate() {
                 tried.push(s);
                 let inv = 1.0 / s;
                 let tw = ((w as f32 * inv).round() as usize).max(2 * FOLD);
                 let th = ((h as f32 * inv).round() as usize).max(2 * FOLD);
-                let (dec, prom, ox, oy) = register_decode(y, w, h, tw, th, &tfft, &mut planner);
-                progress(Progress::Candidate { rank: tried.len(), total: tried.len(), scale: s, strength, prominence: prom, verified: dec.verified, errors: dec.errors_corrected });
+                let (dec, prom, ox, oy, corr) = register_decode(y, w, h, tw, th, &tfft, &mut planner);
+                progress(Progress::Candidate { rank: ti + 1, total: tier_total, scale: s, strength, prominence: prom, verified: dec.verified, errors: dec.errors_corrected });
                 if dec.verified {
                     return BlindResult { data: dec.data, verified: true, errors_corrected: dec.errors_corrected, scale: s, offset: (ox, oy), confidence: prom };
                 }
                 coarse.push((prom, s));
-                if prom > best.1 { best = (dec, prom, (ox, oy), s); }
+                if prom > best.1 { best = (dec, prom, (ox, oy), s, corr); }
             }
         }
 
@@ -1203,12 +1345,12 @@ pub mod registration {
             let s = 1.0_f32.clamp(min_scale, max_scale.max(min_scale));
             let tw = ((w as f32 / s).round() as usize).max(2 * FOLD);
             let th = ((h as f32 / s).round() as usize).max(2 * FOLD);
-            let (dec, prom, ox, oy) = register_decode(y, w, h, tw, th, &tfft, &mut planner);
+            let (dec, prom, ox, oy, corr) = register_decode(y, w, h, tw, th, &tfft, &mut planner);
             if dec.verified {
                 return BlindResult { data: dec.data, verified: true, errors_corrected: dec.errors_corrected, scale: s, offset: (ox, oy), confidence: prom };
             }
             coarse.push((prom, s));
-            best = (dec, prom, (ox, oy), s);
+            best = (dec, prom, (ox, oy), s, corr);
         }
 
         // Refine pass — ±nudge the *most prominent* coarse candidates into the narrow notch
@@ -1224,12 +1366,28 @@ pub mod registration {
                 let inv = 1.0 / s;
                 let tw = ((w as f32 * inv).round() as usize).max(2 * FOLD);
                 let th = ((h as f32 * inv).round() as usize).max(2 * FOLD);
-                let (dec, prom, ox, oy) = register_decode(y, w, h, tw, th, &tfft, &mut planner);
+                let (dec, prom, ox, oy, corr) = register_decode(y, w, h, tw, th, &tfft, &mut planner);
                 progress(Progress::Refine { candidate: ci + 1, scale: s, prominence: prom, verified: dec.verified, errors: dec.errors_corrected });
                 if dec.verified {
                     return BlindResult { data: dec.data, verified: true, errors_corrected: dec.errors_corrected, scale: s, offset: (ox, oy), confidence: prom };
                 }
-                if prom > best.1 { best = (dec, prom, (ox, oy), s); }
+                if prom > best.1 { best = (dec, prom, (ox, oy), s, corr); }
+            }
+        }
+
+        // Soft-decision (Chase) rescue — last resort, only when nothing hard-verified.
+        // The cliff's bit errors concentrate in the least-confident bits (measured in
+        // cliff_error_profile.md), so flipping subsets of those on the most-prominent
+        // candidate, with CRC as the oracle, recovers some past the t=4 ECC budget. Run
+        // once (on `best`) so the common clean path pays nothing and noise candidates
+        // never trigger the 4095-trial search.
+        if !best.0.verified {
+            progress(Progress::Phase("soft-decision rescue"));
+            let chased = decode_bits_chase(&best.4);
+            progress(Progress::Chase { verified: chased.verified, errors: chased.errors_corrected });
+            if chased.verified {
+                return BlindResult { data: chased.data, verified: true, errors_corrected: chased.errors_corrected,
+                                     scale: best.3, offset: best.2, confidence: best.1 };
             }
         }
 
@@ -2149,7 +2307,7 @@ _Lower errors / higher score = better. 0 errors = exact recovery._
         #[derive(Clone)]
         struct Case { stem: String, path: std::path::PathBuf, enc: Enc, enc_label: String,
                       scale: f32, crop: (u32, u32, u32, u32), crop_label: String }
-        enum Win { Coarse(usize, usize), Refine(usize) } // which candidate verified
+        enum Win { Coarse(usize, usize), Refine(usize), Chase } // which strategy verified
 
         let reports = reports_dir();
 
@@ -2205,8 +2363,8 @@ _Lower errors / higher score = better. 0 errors = exact recovery._
         let mut rows = String::new();
         let (mut times, mut dwts, mut ffts, mut searches): (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)
             = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        let (mut total, mut verified, mut clean, mut ecc_used, mut refined, mut skipped)
-            = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        let (mut total, mut verified, mut clean, mut ecc_used, mut refined, mut chased, mut skipped)
+            = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
         let row = |s: &mut String, c: &Case, rec: &str, prom: &str, path: &str, time: &str, ecc: &str, crc: &str| {
             s.push_str(&format!("| {:<10} | {:<4} | {:>5.2} | {:<12} | {:<12} | {:>5} | {:<7} | {:>8} | {:<8} | {:^3} |\n",
                 c.stem, c.enc_label, c.scale, c.crop_label, rec, prom, path, time, ecc, crc));
@@ -2285,6 +2443,8 @@ _Lower errors / higher score = better. 0 errors = exact recovery._
                         if verified { win = Some(Win::Coarse(rank, tot)); },
                     Progress::Refine { candidate, verified, .. } =>
                         if verified { win = Some(Win::Refine(candidate)); },
+                    Progress::Chase { verified, .. } =>
+                        if verified { win = Some(Win::Chase); },
                 };
                 let t0 = Instant::now();
                 r_res = registration::decode_blind_auto_cb(&suspect, dw, dh, registration::DEFAULT_MAX_SOURCE, &mut cb);
@@ -2306,6 +2466,7 @@ _Lower errors / higher score = better. 0 errors = exact recovery._
             if r_res.verified && r_res.errors_corrected == 0 { clean += 1; }
             if r_res.errors_corrected > 0 { ecc_used += 1; }
             if matches!(win, Some(Win::Refine(_))) { refined += 1; }
+            if matches!(win, Some(Win::Chase)) { chased += 1; }
 
             let ratio = if c.scale > 0.0 { r_res.scale / c.scale } else { 0.0 };
             let recovered = format!("{:.2}x {}", r_res.scale, if (ratio - 1.0).abs() < 0.05 { "prim" } else { "harm" });
@@ -2313,6 +2474,7 @@ _Lower errors / higher score = better. 0 errors = exact recovery._
             let path_s = match win {
                 Some(Win::Coarse(rk, tot)) => format!("C{rk}/{tot}"),
                 Some(Win::Refine(cd))      => format!("R c{cd}"),
+                Some(Win::Chase)           => "Chase".to_string(),
                 None                       => "—".to_string(),
             };
             let time_s = fmt_secs(secs);
@@ -2349,7 +2511,7 @@ The watermark is composited in uncompressed RGB (as on screen) and meets compres
 screenshot-save step, so `enc` is the *save format*; the source photo's own JPEG history is
 irrelevant.  The matrix is defined in [`tests/blind_sweep.yaml`](../blind_sweep.yaml) — one line per case.
 
-**{verified}/{total} CRC-verified · {clean}/{total} clean (no ECC) · {ecc_used} used ECC · {refined} needed refine · {skipped} skipped.**
+**{verified}/{total} CRC-verified · {clean}/{total} clean (no ECC) · {ecc_used} used ECC · {refined} needed refine · {chased} needed Chase · {skipped} skipped.**
 **Decode time (production path, release): median {med}, max {max}.**
 Per-decode split (median): templates {med_dwt} + FFT {med_fft} + search {med_search}; one-time template setup peaks at {max_setup}.
 
@@ -2545,6 +2707,264 @@ _A narrow 0-error notch with `score` peaking there and falling off monotonically
  a clean objective for the Phase-8 fine search._
 ");
         std::fs::write(reports.join("scale_precision.md"), report).unwrap();
+    }
+
+    // ── 3.2 diagnostic: are cliff bit-errors concentrated in the low-confidence bits? ──
+    // Steers the soft-decision / Chase decision. For a ladder of increasingly punishing
+    // *casual* channels (display rescale → crop → low-q JPEG), decode at the KNOWN-true
+    // scale (`decode_corr_at`; the crop offset is registered internally) and, per case,
+    // rank the 192 codeword bits by correlation confidence |corr| (rank 0 = least
+    // confident); report how many pre-ECC error bits land among the k least-confident.
+    // If errors cluster low, Chase (flip the k least-confident, CRC-verify) rescues cliff
+    // cases past the t=4 budget; if they're spread uniformly, errors are interference-
+    // structured and Chase won't help — itself an informative finding.
+    #[cfg(feature = "registration")]
+    #[test]
+    #[ignore]
+    fn cliff_error_profile() {
+        use image::{codecs::jpeg::JpegEncoder, imageops::{self, FilterType},
+                    ExtendedColorType, ImageEncoder, RgbImage};
+        let reports = reports_dir();
+        let img = image::open(canonical_fixture()).unwrap().into_rgb8();
+        let (ow, oh) = (img.width() as usize, img.height() as usize);
+        let pixels = img.into_raw();
+        let orig_y = extract_y_rgb(&pixels);
+        let mut wm_y = orig_y.clone();
+        embed_y_masked(&mut wm_y, ow, oh, &PHASE3_PAYLOAD, MASK_STRENGTH);
+        let mut wm_rgb = pixels.clone();
+        write_y_delta_rgb(&mut wm_rgb, &orig_y, &wm_y);
+        let expected = payload_to_bits(&full_payload(&PHASE3_PAYLOAD));
+
+        // (label, jpeg quality, display scale, crop fraction removed per edge)
+        let cases: &[(&str, u8, f32, f32)] = &[
+            ("q90 1.00 0%",  90, 1.00, 0.00),
+            ("q70 0.80 5%",  70, 0.80, 0.05),
+            ("q50 0.66 10%", 50, 0.66, 0.10),
+            ("q40 0.60 12%", 40, 0.60, 0.12),
+            ("q40 0.50 15%", 40, 0.50, 0.15),
+        ];
+
+        let mut rows = String::new();
+        for &(label, q, scale, cf) in cases {
+            // scale (display) → crop (screenshot) → encode (save).
+            let src = RgbImage::from_raw(ow as u32, oh as u32, wm_rgb.clone()).unwrap();
+            let (nw, nh) = ((ow as f32 * scale).round() as u32, (oh as f32 * scale).round() as u32);
+            let scaled = if (scale - 1.0).abs() < 1e-6 { src }
+                         else { imageops::resize(&src, nw.max(1), nh.max(1), FilterType::Lanczos3) };
+            let (sw, sh) = (scaled.width(), scaled.height());
+            let (cl, ct) = ((sw as f32 * cf) as u32, (sh as f32 * cf) as u32);
+            let (cw, ch) = (sw - 2 * cl, sh - 2 * ct);
+            let cropped = imageops::crop_imm(&scaled, cl, ct, cw, ch).to_image();
+            let mut buf = Vec::new();
+            JpegEncoder::new_with_quality(&mut buf, q)
+                .write_image(cropped.as_raw(), cw, ch, ExtendedColorType::Rgb8).unwrap();
+            let dec_rgb = image::load_from_memory(&buf).unwrap().into_rgb8().into_raw();
+            let suspect = extract_y_rgb(&dec_rgb);
+
+            // Decode at the known-true scale: undo the display rescale (cw/scale × ch/scale);
+            // the center-crop offset is absorbed by the internal fold-offset search.
+            let (tw, th) = ((cw as f32 / scale).round() as usize, (ch as f32 / scale).round() as usize);
+            let (_dec, corr) = registration::decode_corr_at(&suspect, cw as usize, ch as usize, tw, th);
+
+            // Rank bits by ascending confidence |corr| (rank 0 = least confident).
+            let mut order: Vec<usize> = (0..PAYLOAD_BITS).collect();
+            order.sort_by(|&a, &b| corr[a].abs().partial_cmp(&corr[b].abs()).unwrap());
+            let mut rank_of = vec![0usize; PAYLOAD_BITS];
+            for (rank, &bit) in order.iter().enumerate() { rank_of[bit] = rank; }
+            let mut err_ranks: Vec<usize> = (0..PAYLOAD_BITS)
+                .filter(|&i| (corr[i] > 0.0) != expected[i])
+                .map(|i| rank_of[i]).collect();
+            err_ranks.sort_unstable();
+            let nerr = err_ranks.len();
+            let in_k = |k: usize| err_ranks.iter().filter(|&&r| r < k).count();
+            let median_rank = if nerr == 0 { 0 } else { err_ranks[nerr / 2] };
+            rows.push_str(&format!(
+                "| {:<13} | {:>4} | {:>5} | {:>6} | {:>6} | {:>11} |\n",
+                label, nerr, in_k(8), in_k(16), in_k(32), median_rank));
+            println!("{label}: errs={nerr} in≤8={} in≤16={} in≤32={} median_rank={median_rank}/{PAYLOAD_BITS}",
+                in_k(8), in_k(16), in_k(32));
+        }
+
+        let stamp = report_stamp();
+        let report = format!(
+"# 3.2 — cliff error-confidence profile (matched decode at known scale)
+
+{stamp}
+
+Diagnostic for the **soft-decision / Chase** question. The canonical fixture is embedded
+(CDF 5/3, ALPHA={alpha}, levels {levels:?}, mask {mask}), pushed through a ladder of casual
+channels (display rescale → crop → low-q JPEG), then decoded **at the known-true scale**
+via `decode_corr_at` (the crop offset is registered internally, so registration is removed
+as a variable but cropping is still exercised). The 192 codeword bits are ranked by
+correlation confidence |corr| (rank 0 = least confident); the table counts how many of the
+pre-ECC error bits land among the k least-confident.
+
+Regenerate: `cargo test -p glimr --features registration --release cliff_error_profile -- --ignored --nocapture`
+
+| channel       | errs | in ≤8 | in ≤16 | in ≤32 | median rank |
+|---------------|------|-------|--------|--------|-------------|
+{rows}
+_Error bits concentrated at low ranks (small median, most within ≤8–16) ⇒ Chase decoding
+(flip the k least-confident, CRC-verify) rescues cliff cases past t=4. Errors spread toward
+rank ~96 (uniform) ⇒ interference-structured, Chase won't help. Caveat: rescale rounding can
+leave a sub-notch scale residual; treat the error **distribution** (shape), not the absolute
+count, as the signal here._
+",
+            alpha = ALPHA, levels = EMBED_LEVELS, mask = MASK_STRENGTH, rows = rows);
+        std::fs::write(reports.join("cliff_error_profile.md"), report).unwrap();
+        println!("cliff error profile → {}", reports.join("cliff_error_profile.md").display());
+    }
+
+    // ── 3.3 diagnostic: does sub-bin (parabolic) autocorr-peak interpolation beat the ──
+    // integer lag? Integer autocorr lag is ~0.4%-quantized at period 256; the matched
+    // notch is <0.25% wide, so the blind finder partly relies on a refine rung landing in
+    // the notch. For a set of known true scales, compare the implied-scale error of the
+    // integer peak vs the parabola-refined peak (`scale_peaks_subbin`). Pure measurement —
+    // no decode-path change. If the refined error is consistently ~notch-width or finer,
+    // wiring `scale_peaks_subbin` into candidate generation makes blind decode faster
+    // (fewer refine rungs) and more reliable.
+    #[cfg(feature = "registration")]
+    #[test]
+    #[ignore]
+    fn subbin_precision() {
+        let reports = reports_dir();
+        let ref_period = (4 * TILE_SIDE) as f32; // 256 — level-2 tile period at scale 1.0
+        let img = image::open(canonical_fixture()).unwrap().into_rgb8();
+        let (ow, oh) = (img.width() as usize, img.height() as usize);
+        let pixels = img.into_raw();
+        let orig_y = extract_y_rgb(&pixels);
+        let mut wm_y = orig_y.clone();
+        embed_y_masked(&mut wm_y, ow, oh, &PHASE3_PAYLOAD, MASK_STRENGTH);
+
+        // Nearest-to-truth peak in a (lag,val) list → implied scale (lag/ref_period at d=1).
+        let nearest = |peaks: &[(f32, f32)], true_lag: f32| -> Option<f32> {
+            peaks.iter().map(|&(l, _)| l)
+                .min_by(|a, b| (a - true_lag).abs().partial_cmp(&(b - true_lag).abs()).unwrap())
+        };
+
+        let scales = [0.50f32, 0.66, 0.80, 0.95, 1.00, 1.20, 1.49, 2.00];
+        let mut rows = String::new();
+        let (mut sum_int, mut sum_sub, mut n) = (0f64, 0f64, 0u32);
+        for &s in &scales {
+            let (nw, nh) = ((ow as f32 * s).round() as usize, (oh as f32 * s).round() as usize);
+            let suspect = resample_y(&wm_y, ow, oh, nw, nh);
+            let true_lag = ref_period * s; // level-2 period in the suspect
+            let pk_int = registration::scale_peaks(&suspect, nw, nh, 6)
+                .into_iter().map(|(l, v)| (l as f32, v)).collect::<Vec<_>>();
+            let pk_sub = registration::scale_peaks_subbin(&suspect, nw, nh, 6);
+            let (li, ls) = (nearest(&pk_int, true_lag), nearest(&pk_sub, true_lag));
+            match (li, ls) {
+                (Some(li), Some(ls)) => {
+                    let est_i = li / ref_period;
+                    let est_s = ls / ref_period;
+                    let e_i = ((est_i - s) / s * 100.0).abs();
+                    let e_s = ((est_s - s) / s * 100.0).abs();
+                    sum_int += e_i as f64; sum_sub += e_s as f64; n += 1;
+                    rows.push_str(&format!(
+                        "| {:>5.2} | {:>7.1} | {:>7.2} | {:>7.3}% | {:>8.3} | {:>7.3}% |\n",
+                        s, true_lag, li, e_i, ls, e_s));
+                    println!("s={s:.2}: int_lag={li:.2} ({e_i:.3}%)  sub_lag={ls:.3} ({e_s:.3}%)");
+                }
+                _ => {
+                    rows.push_str(&format!("| {:>5.2} | {:>7.1} | {:>7} | {:>8} | {:>8} | {:>8} |\n",
+                        s, true_lag, "—", "absent", "—", "—"));
+                    println!("s={s:.2}: peak absent");
+                }
+            }
+        }
+        let (mean_i, mean_s) = if n > 0 { (sum_int / n as f64, sum_sub / n as f64) } else { (0.0, 0.0) };
+        let stamp = report_stamp();
+        let report = format!(
+"# 3.3 — sub-bin autocorr-peak precision (integer vs parabolic)
+
+{stamp}
+
+The canonical fixture is embedded then resampled to a set of *known* true scales. For each,
+the whitened-autocorrelation peak nearest the true level-2 period (256·s) is taken from
+[`scale_peaks`] (integer lag) and [`scale_peaks_subbin`] (parabola-refined lag); the implied
+scale is `lag / {ref_period:.0}` and the error is vs the known true scale. Integer lag
+quantizes to ~0.4% at period 256; the matched-decode notch is <0.25% wide.
+
+Regenerate: `cargo test -p glimr --features registration --release subbin_precision -- --ignored --nocapture`
+
+| scale | true lag | int lag | int err | sub lag | sub err |
+|-------|----------|---------|---------|---------|---------|
+{rows}
+**Mean |scale error|: integer {mean_i:.3}%, sub-bin {mean_s:.3}%.**
+
+_If sub-bin error is consistently below the ~0.25% notch width (and well under the integer
+error), wiring `scale_peaks_subbin` into candidate generation lands more candidates in the
+notch directly — fewer refine rungs fired, faster *and* more reliable blind decode._
+",
+            ref_period = ref_period, rows = rows, mean_i = mean_i, mean_s = mean_s);
+        std::fs::write(reports.join("subbin_precision.md"), report).unwrap();
+        println!("subbin precision → {}", reports.join("subbin_precision.md").display());
+    }
+
+    // ── 3.1 measurement: source-size floor with full-accumulation fold ──
+    // `fold_tile` now sums *all* periods (not just whole-FOLD multiples). This measures
+    // the resulting floor: the marked canonical fixture is downscaled (lossless) to a
+    // ladder of long-edge sizes and decoded both **blind** (production path — finder +
+    // full-accumulation fold reader) and **matched** at the known original size (signal-
+    // present reference; note the matched path does not use `fold_tile`). Prior baseline
+    // before this change: blind finder gave up ~1024, clean matched floor ≈896 px.
+    #[cfg(feature = "registration")]
+    #[test]
+    #[ignore]
+    fn source_size_floor() {
+        let reports = reports_dir();
+        let img = image::open(canonical_fixture()).unwrap().into_rgb8();
+        let (ow, oh) = (img.width() as usize, img.height() as usize);
+        let pixels = img.into_raw();
+        let orig_y = extract_y_rgb(&pixels);
+        let mut wm_y = orig_y.clone();
+        embed_y_masked(&mut wm_y, ow, oh, &PHASE3_PAYLOAD, MASK_STRENGTH);
+        let long = ow.max(oh);
+
+        let sizes = [1280usize, 1152, 1024, 960, 896, 832, 768, 704, 640, 576, 512];
+        let mut rows = String::new();
+        for &target in &sizes {
+            if target >= long { continue; }
+            let s = target as f32 / long as f32;
+            let (nw, nh) = ((ow as f32 * s).round() as usize, (oh as f32 * s).round() as usize);
+            let suspect = resample_y(&wm_y, ow, oh, nw, nh);
+
+            let blind = registration::decode_blind_auto(&suspect, nw, nh);
+            let (matched, mscore) = decode_y_at_size_verbose(&suspect, nw, nh, ow, oh);
+            rows.push_str(&format!(
+                "| {:>4} | {:>9} | {:^5} | {:>4} | {:>6.2} | {:^7} | {:>4} | {:>6.1} |\n",
+                target, format!("{}×{}", nw, nh),
+                if blind.verified { "✓" } else { "·" }, crop_errs(&blind.data), blind.confidence,
+                if matched.verified { "✓" } else { "·" }, crop_errs(&matched.data), mscore));
+            println!("{target}px ({nw}×{nh}): blind crc={} errs={} prom={:.2} | matched crc={} errs={} score={:.1}",
+                blind.verified, crop_errs(&blind.data), blind.confidence,
+                matched.verified, crop_errs(&matched.data), mscore);
+        }
+        let stamp = report_stamp();
+        let report = format!(
+"# 3.1 — source-size floor (full-accumulation fold)
+
+{stamp}
+
+The marked canonical fixture ({ow}×{oh}) downscaled (lossless, Lanczos) to a descending
+long-edge ladder, then decoded two ways. **Blind** = the production `decode_blind_auto`
+(scale finder + the now-full-accumulation `fold_tile` reader). **Matched** = `decode_y_at_size`
+at the known original size — a signal-present reference (it does *not* use `fold_tile`, so it
+is unaffected by the 3.1 change; it shows whether the mark survived the downscale at all).
+Baseline before full-accumulation fold: blind finder gave up ~1024 px, clean matched floor ≈896.
+
+Regenerate: `cargo test -p glimr --features registration --release source_size_floor -- --ignored --nocapture`
+
+| long | resized   | blind | errs |  prom  | match | errs | score |
+|------|-----------|-------|------|--------|-------|------|-------|
+{rows}
+_The smallest `long` with blind crc ✓ is the production floor; matched ✓ below that marks the
+gap the finder/reader still leave on the table. Compare the blind floor against the ~1024 px
+baseline to read off what full accumulation bought._
+",
+            ow = ow, oh = oh, rows = rows);
+        std::fs::write(reports.join("source_size_floor.md"), report).unwrap();
+        println!("source-size floor → {}", reports.join("source_size_floor.md").display());
     }
 
     // ── Phase 5b: blind-sync mechanism (white-seamless vs detail-rich) ────────

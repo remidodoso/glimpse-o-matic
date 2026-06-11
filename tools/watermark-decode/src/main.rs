@@ -166,6 +166,14 @@ fn blind_with_progress(y: &[f32], w: usize, h: usize, max_source: usize, verbose
                     let _ = std::io::stderr().flush();
                 }
             }
+            Chase { verified, errors } => {
+                if verbose {
+                    eprintln!("  · soft-decision (Chase) rescue: {}", mark(verified, errors));
+                } else if bar {
+                    eprint!("\r  recovering… soft-decision rescue{:<14}", "");
+                    let _ = std::io::stderr().flush();
+                }
+            }
         }
     };
     let r = watermark::registration::decode_blind_auto_cb(y, w, h, max_source, &mut cb);
