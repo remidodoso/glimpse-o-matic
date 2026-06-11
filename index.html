@@ -5,9 +5,9 @@
     <!-- Build 0610:1727 -->
  
     <script type="module">
-        import init, { xor_decode, GlimrRenderer, glimr_log } from './pkg/glimr.js';
+        import init, { GlimrRenderer, glimr_log } from './pkg/glimr.js';
         await init();
-        window.glimr = { xor_decode, GlimrRenderer, glimr_log };
+        window.glimr = { GlimrRenderer, glimr_log };
         window.renderer = new GlimrRenderer(
             document.getElementById('photo'),
             document.getElementById('backing')
