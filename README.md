@@ -4,6 +4,8 @@ A lightweight browser-based photo gallery viewer.
 
 **[Open Glimpse-o-Matic](https://remidodoso.github.io/glimpse-o-matic/)**
 
+**[White Paper](https://remidodoso.github.io/glimpse-o-matic/white_paper/white_paper.html)**
+
 ---
 
 ## GitHub Pages setup
