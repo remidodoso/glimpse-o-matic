@@ -99,6 +99,17 @@
     padding: .05em .35em;
     border-radius: 3px;
   }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    padding: .9rem 1.1rem;
+    overflow-x: auto;
+    font-family: "SF Mono", "Cascadia Code", Consolas, Menlo, monospace;
+    font-size: .74rem;
+    line-height: 1.55;
+  }
+  pre code { background: none; padding: 0; font-size: inherit; }
   sub { font-size: .72em; }
 
   .subtitle {
@@ -1140,6 +1151,8 @@
       Shrinking an image blurs it, and blurring weakens the finest scale of the mark first, so in a downscaled suspect the strongest peak is often not the true tile period but a harmonic of it — a confident peak at twice the true spacing.
       The decoder accommodates this: each period the finder reports is expanded into a small family — the period, its half, and its third — and every member is tried, strongest first, until one decodes and verifies.
       Because the tiling is self-similar, a harmonic decodes correctly; it is simply another route in.
+      A planned post-MVP experiment attacks the ambiguity at its source: the current tile periods are powers of two, each an exact octave of the next, so every peak has plausible siblings.
+      Overlaying a few tilings of relatively prime periods at roughly the same scale would remove the ambiguity by construction — a set of coprime periods can agree on only one scale — though whether the change also gains or costs signal-to-noise remains to be measured.
     </p>
     <p>
       <strong class="run-in">Upscaled captures.</strong>
@@ -1350,20 +1363,20 @@
   <p>
     Navigation divides the image into thirds.
     Tapping the left or right third moves to the previous or next photograph with a slide animation; a drag past a quarter of the width does the same.
-    Tapping the center enters zoom mode at 1:1 pixel scale, as do the scroll wheel, a pinch, and keyboard steps — each zooming toward the cursor, pinch midpoint, or screen center respectively — and all exit automatically on returning to fit scale.
-    In zoom mode, dragging and the arrow keys pan.
+    Tapping the center enters zoom mode at 1:1 pixel scale, as do the scroll wheel, a pinch, and keyboard steps — each zooming toward the cursor, pinch midpoint, or screen center respectively — and zooming continues past 1:1 to a 2:1 maximum.
+    All of them exit automatically on returning to fit scale, and in zoom mode, dragging and the arrow keys pan.
   </p>
 
   <figure>
     <div class="panels">
       <span class="panel"><img loading="lazy" decoding="async" src="figures/screencaps/ui_portrait.png" alt="The viewer in portrait orientation, carousel across the top" data-caption="Portrait: the carousel moves to the top edge."><span class="panel-label">portrait</span></span>
-      <span class="panel"><img loading="lazy" decoding="async" src="figures/screencaps/ui_zoom.png" alt="Zoom mode at 1:1 pixel scale, panned to a detail of the photograph" data-caption="Zoom mode at 1:1 — the image at native resolution, panned to a detail."><span class="panel-label">zoom at 1:1</span></span>
+      <span class="panel"><img loading="lazy" decoding="async" src="figures/screencaps/ui_zoom.png" alt="Zoom mode at the 2:1 maximum, panned to a detail of the photograph" data-caption="Zoom mode at the 2:1 maximum — twice native pixel size, panned to a detail."><span class="panel-label">zoomed to 2:1</span></span>
       <span class="panel"><img loading="lazy" decoding="async" src="figures/screencaps/ui_swipe.png" alt="A slide navigation caught mid-animation, the incoming photograph entering from the right" data-caption="Slide navigation caught mid-animation: the incoming photograph enters from the right."><span class="panel-label">mid-slide</span></span>
     </div>
     <figcaption>
       <span class="figlabel">Orientation, zoom, and navigation.</span>
       Left: the same gallery in portrait, the carousel now across the top.
-      Center: zoom mode at 1:1, panned to a detail.
+      Center: zoom mode at its 2:1 maximum, panned to a detail.
       Right: a slide navigation caught mid-animation, the incoming photograph entering from the right.
       The portrait capture, run through the blind decoder exactly as committed here, verifies — see <a class="xref" href="#forensic-decode">Forensic Decode &amp; Client Attribution</a>.
     </figcaption>
@@ -1440,6 +1453,64 @@
     A 1.49×-zoomed, cropped, re-saved screenshot — found in the wild during development — decodes blind and verifies, the case that motivated the pyramid search.
     A copy uploaded to a social network, transcoded to WebP by its pipeline, and downloaded again also verified, with the error correction absorbing three flipped bits; that capture's provenance is lost, so the paper reports it as experience rather than exhibit, and the standing sweep's WebP measurement stands in as the reproducible evidence.
   </p>
+
+  <figure class="single">
+    <pre><code>sstest32.jpg
+  source    : 1466×1492  (2.19 MP, 453 KB)
+  · native decode unverified (score 11) → recovering blind…
+  · building templates…
+  · transforming templates…
+  · estimating scale…
+  · candidate 1/8: scale 0.534 → prominence 1.6  ✗
+  · candidate 2/8: scale 0.788 → prominence 1.5  ✗
+  · candidate 3/8: scale 0.394 → prominence 1.7  ✗
+  · candidate 4/8: scale 1.125 → prominence 1.6  ✗
+  · candidate 5/8: scale 0.563 → prominence 1.5  ✗
+  · candidate 6/8: scale 0.375 → prominence 1.7  ✗
+  · candidate 7/8: scale 0.953 → prominence 1.5  ✗
+  · candidate 8/8: scale 0.476 → prominence 1.6  ✗
+  · candidate 1/8: scale 2.000 → prominence 1.6  ✗
+  · candidate 2/8: scale 1.000 → prominence 2.3  ✗
+  · candidate 3/8: scale 0.667 → prominence 1.5  ✗
+  · candidate 4/8: scale 0.789 → prominence 1.5  ✗
+  · candidate 5/8: scale 1.108 → prominence 1.5  ✗
+  · candidate 6/8: scale 0.554 → prominence 1.6  ✗
+  · candidate 7/8: scale 1.335 → prominence 1.5  ✗
+  · candidate 8/8: scale 0.445 → prominence 1.6  ✗
+  · refining (no clean candidate)…
+  · refine (cand 1): scale 0.9898 → prominence 1.5  ✗
+  · refine (cand 1): scale 0.9948 → prominence 1.9  ✗
+  · refine (cand 1): scale 1.0048 → prominence 2.1  ✗
+  · refine (cand 1): scale 1.0098 → prominence 1.5  ✗
+  · refine (cand 2): scale 0.3713 → prominence 1.6  ✗
+  · refine (cand 2): scale 0.3732 → prominence 1.6  ✗
+  · refine (cand 2): scale 0.3769 → prominence 1.7  ✗
+  · refine (cand 2): scale 0.3788 → prominence 1.7  ✗
+  · refine (cand 3): scale 0.3899 → prominence 1.7  ✗
+  · refine (cand 3): scale 0.3918 → prominence 1.7  ✗
+  · refine (cand 3): scale 0.3958 → prominence 1.7  ✗
+  · refine (cand 3): scale 0.3977 → prominence 1.6  ✗
+  · refine (cand 4): scale 0.5486 → prominence 1.6  ✗
+  · refine (cand 4): scale 0.5513 → prominence 1.6  ✗
+  · refine (cand 4): scale 0.5569 → prominence 1.6  ✗
+  · refine (cand 4): scale 0.5596 → prominence 1.6  ✗
+  · soft-decision rescue…
+  · soft-decision (Chase) rescue: ✓ CRC, ECC fixed 4
+  recovered : scale 1.000, tile offset (339,318)
+  detection : verified (CRC ok)  (confidence 2.3)  ·  ECC corrected 4 bit errors
+  version   : 1
+  timestamp : 2026-06-09 22:18:19 UTC  (unix 1781043499)
+  ipv4      : n/a
+  browser   : 6effd55f
+  referrer  : 2023  (present)
+  payload   : 2b 91 28 6a  00 00 00 00  5f d5 ff 6e  23 20 01 01</code></pre>
+    <figcaption>
+      <span class="figlabel">One hard capture, decoded end to end.</span>
+      The decoder's own narration of a real screenshot capture that exercises every stage this paper has described.
+      The native fast path fails; eight full-resolution scale candidates and eight more from the pyramid fail; the refinement ladder around the four most prominent candidates fails; and the soft-decision pass then retries the least-confident bits until the error correction and the checksum agree — four bits repaired, verified at confidence 2.3.
+      Note that the true scale, 1.000, was among the early candidates: the read at that scale carried five or more raw bit errors, too many for correction alone, and only the soft-decision retry brought it inside the four-bit budget.
+    </figcaption>
+  </figure>
   <p>
     This paper also demonstrates the machinery on itself.
     The portrait screenshot in <a class="xref" href="#viewer-ui">The Viewer UI</a> is an ordinary, untouched capture of the viewer — the photograph displayed at fit scale, the carousel and interface chrome included in the frame.

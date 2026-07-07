@@ -300,6 +300,13 @@ eventually measuring as per-fixture floors rather than one number.
 4. **Stale numbers in `notes_and_status.md`:** earlier sections still say "40/40" where
    the current report says 51/53 of a larger matrix. Fine for a log; just noting that the
    reports + source are ground truth for any prose derived from the notes.
+5. **Verbose candidate lines always print `(autocorr 0.0)`** (observed 2026-07-06, e.g.
+   `candidate 1/8: scale 0.534 (autocorr 0.0) → prominence 1.6`): the autocorrelation-strength
+   field renders as 0.0 for every candidate on every run tried, so either the value isn't
+   threaded into the `Progress` event or the formatting truncates it. Cosmetic. The white
+   paper publishes a decode transcript (sstest32, in Forensic Decode) with that column
+   trimmed to avoid confusing readers — once fixed, the transcript could be regenerated
+   verbatim.
 
 ---
 
