@@ -217,10 +217,70 @@ def chart_tuning():
     save("chart_tuning.svg", s)
 
 
+# ── 6. Whitening: the buried peak, surfaced ──────────────────────────────────
+def chart_whitening():
+    _, rows = _read("whitening_profile.csv")
+    lo, hi = 24, 520
+    xs = [r[0] for r in rows if lo <= r[0] <= hi]
+    raw = [r[1] for r in rows if lo <= r[0] <= hi]
+    wht = [r[2] for r in rows if lo <= r[0] <= hi]
+    # Wildly different units (raw autocorr vs whitened): normalize each to its own peak.
+    rmax, wmax = max(raw), max(wht)
+    raw = [v / rmax for v in raw]
+    wht = [v / wmax for v in wht]
+    ymin, ymax = min(min(raw), min(wht), -0.05) * 1.1, 1.1
+    s = _hdr("One lag profile, before and after whitening", "each normalized to its own peak")
+    def px(x): return ML + PW * (x - lo) / (hi - lo)
+    x = px(256)
+    s.append(f'<line x1="{x:.1f}" y1="{MT}" x2="{x:.1f}" y2="{MT+PH}" stroke="{A}" '
+             f'stroke-width="1" stroke-dasharray="4 4" opacity="0.6"/>')
+    s.append(f'<text class="tl" x="{x:.1f}" y="{MT+12}" text-anchor="middle" fill="{A}">tile period → 256</text>')
+    for lag in (128, 256, 384, 512):
+        s.append(f'<text class="tl" x="{px(lag):.1f}" y="{MT+PH+18}" text-anchor="middle">{lag}</text>')
+    s.append(_poly(xs, raw, B, lo, hi, ymin, ymax, 1.5))
+    s.append(_poly(xs, wht, A, lo, hi, ymin, ymax, 1.8))
+    _frame(s)
+    s.append(f'<text class="t" x="{ML+PW/2}" y="{H-8}" text-anchor="middle">lag (pixels)</text>')
+    _legend(s, [("whitened", A), ("raw", B)], ML + PW - 120, MT + 16)
+    save("chart_whitening.svg", s)
+
+
+# ── 7. Whitening's blind region: the upscaled capture, full-res vs ½-pyramid ─
+def chart_whitening_upscale():
+    _, rows = _read("whitening_upscale_profile.csv")
+    lo, hi = 24, 520
+    xs = [r[0] for r in rows if lo <= r[0] <= hi]
+    full = [r[1] for r in rows if lo <= r[0] <= hi]
+    half = [r[2] for r in rows if lo <= r[0] <= hi]
+    fmax, hmax = max(full), max(half)
+    full = [v / fmax for v in full]
+    half = [v / hmax for v in half]
+    ymin, ymax = min(min(full), min(half), -0.05) * 1.1, 1.1
+    s = _hdr("An upscaled capture: buried at full resolution, first at half",
+             "each normalized to its own peak")
+    def px(x): return ML + PW * (x - lo) / (hi - lo)
+    for lag, lab, col in ((191, "½-pyramid → 191 (rank #1)", B),
+                          (382, "true period at 1.49× → 382 (rank #21)", A)):
+        x = px(lag)
+        s.append(f'<line x1="{x:.1f}" y1="{MT}" x2="{x:.1f}" y2="{MT+PH}" stroke="{col}" '
+                 f'stroke-width="1" stroke-dasharray="4 4" opacity="0.6"/>')
+        s.append(f'<text class="tl" x="{x:.1f}" y="{MT+12}" text-anchor="middle" fill="{col}">{lab}</text>')
+    for lag in (128, 256, 384, 512):
+        s.append(f'<text class="tl" x="{px(lag):.1f}" y="{MT+PH+18}" text-anchor="middle">{lag}</text>')
+    s.append(_poly(xs, full, A, lo, hi, ymin, ymax, 1.5))
+    s.append(_poly(xs, half, B, lo, hi, ymin, ymax, 1.8))
+    _frame(s)
+    s.append(f'<text class="t" x="{ML+PW/2}" y="{H-8}" text-anchor="middle">lag (pixels), whitened profiles</text>')
+    _legend(s, [("full resolution", A), ("½-pyramid level", B)], ML + 14, MT + 16)
+    save("chart_whitening_upscale.svg", s)
+
+
 if __name__ == "__main__":
     chart_corr()
     chart_autocorr()
     chart_needle()
     chart_fence()
     chart_tuning()
+    chart_whitening()
+    chart_whitening_upscale()
     print("charts ->", FIG)

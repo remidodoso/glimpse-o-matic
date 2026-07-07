@@ -1139,6 +1139,77 @@ pub mod registration {
         (autocorr_whitened(&blk, sb, &mut planner), 2 * sb)
     }
 
+    /// The scale block (`SCALE_BLOCK`, clamped to the image) the finder whitens. Exposed
+    /// so the WP15 whitening figures operate on exactly the region the finder sees.
+    pub fn scale_block_of(y: &[f32], w: usize, h: usize) -> (Vec<f32>, usize) {
+        let sb = SCALE_BLOCK.min(w).min(h);
+        (extract(y, w, (w - sb) / 2, (h - sb) / 2, sb), sb)
+    }
+
+    /// Spectrally whiten a b×b block **keeping phase**, returning a real (zero-mean) image:
+    /// each Fourier magnitude is divided by the local (box-blurred) magnitude envelope, so
+    /// slow gradients and flats are suppressed while edges, fine texture, and the periodic
+    /// mark are lifted — visually an extreme unsharp-mask / "clarity" push. This is *what
+    /// the scale-finder listens to*. (`autocorr_whitened` discards phase because it only
+    /// wants the flattened power spectrum; this variant keeps phase so the result is a
+    /// viewable image.) Exposed for WP15(a). Operates at size `b` (no 2× lag-padding — we
+    /// want the image, not the autocorrelation).
+    pub fn whiten_block_image(block: &[f32], b: usize) -> Vec<f32> {
+        let mut planner = FftPlanner::<f32>::new();
+        let mean = block.iter().sum::<f32>() / (b * b) as f32;
+        let mut buf: Vec<Complex<f32>> = block.iter().map(|&v| Complex::new(v - mean, 0.0)).collect();
+        fft_2d(&mut buf, b, &mut planner, false);
+        let power: Vec<f32> = buf.iter().map(|z| z.norm_sqr()).collect();
+        let env = box_blur(&power, b, 6);
+        for (z, &e) in buf.iter_mut().zip(env.iter()) { *z /= e.sqrt() + 1e-3; } // divide magnitude, keep phase
+        fft_2d(&mut buf, b, &mut planner, true);
+        let norm = (b * b) as f32;
+        buf.iter().map(|z| z.re / norm).collect()
+    }
+
+    /// Raw (un-whitened) autocorrelation of a b×b block — same windowing / normalization /
+    /// lag layout as [`autocorr_whitened`], only the spectral-flattening step removed, so a
+    /// raw-vs-whitened profile comparison is apples-to-apples. Exposed for WP15(b): shows
+    /// the mark's tile-period peak buried under the image's own low-frequency
+    /// autocorrelation until whitening flattens the spectrum.
+    fn autocorr_raw(block: &[f32], b: usize, planner: &mut FftPlanner<f32>) -> Vec<f32> {
+        let n = 2 * b;
+        let mean = block.iter().sum::<f32>() / (b * b) as f32;
+        let mut buf = vec![Complex::new(0.0f32, 0.0); n * n];
+        for y in 0..b { let wy = hann(y, b); for x in 0..b {
+            buf[y * n + x] = Complex::new((block[y * b + x] - mean) * wy * hann(x, b), 0.0);
+        }}
+        fft_2d(&mut buf, n, planner, false);
+        for z in buf.iter_mut() { *z = Complex::new(z.norm_sqr(), 0.0); }
+        fft_2d(&mut buf, n, planner, true);
+        let norm = (n * n) as f32;
+        let mut out = vec![0.0f32; n * n];
+        for y in 0..n { for x in 0..n { out[((y + b) % n) * n + (x + b) % n] = buf[y * n + x].re / norm; } }
+        out
+    }
+
+    /// Like [`autocorr_lag_profile`] but **without** spectral whitening (raw
+    /// autocorrelation of the centre block). Exposed for WP15(b).
+    pub fn autocorr_lag_profile_raw(y: &[f32], w: usize, h: usize) -> Vec<f32> {
+        let mut planner = FftPlanner::<f32>::new();
+        let sb = SCALE_BLOCK.min(w).min(h);
+        let blk = extract(y, w, (w - sb) / 2, (h - sb) / 2, sb);
+        let ac = autocorr_raw(&blk, sb, &mut planner);
+        let n = 2 * sb; let c = sb;
+        (0..sb).map(|lag| ac[c * n + c + lag].max(ac[(c + lag) * n + c])).collect()
+    }
+
+    /// Rank (1-based) of the strongest whitened-autocorr peak whose lag falls within
+    /// `±tol_frac` of `expected_lag`, among all peaks strongest-first — or `None` if no peak
+    /// lands in the window. Used by WP15(c) to quote "true period ranked ~#N" the way the
+    /// sstest51 investigation did (buried at full res, #1 at ½×).
+    pub fn peak_rank_near(y: &[f32], w: usize, h: usize, expected_lag: f32, tol_frac: f32) -> Option<usize> {
+        let sb = SCALE_BLOCK.min(w).min(h);
+        let peaks = scale_peaks(y, w, h, sb); // all peaks, strongest-first
+        let tol = expected_lag * tol_frac;
+        peaks.iter().position(|&(lag, _)| (lag as f32 - expected_lag).abs() <= tol).map(|i| i + 1)
+    }
+
     /// Per-bit spatial templates: pn_b tiled into the embed bands (LH/HL at
     /// EMBED_LEVELS), inverse-DWT, one FOLD×FOLD interior tile.  Payload-independent
     /// references; the secret key (WM_KEY via pn_tile) is what makes them keyed.
@@ -2651,6 +2722,153 @@ mod tests {
         image::save_buffer(out.join("autocorr_surface_1.0x.png"), &px, cs as u32, cs as u32, ColorType::Rgb8).unwrap();
         println!("WP12 (c) 2D autocorr surface → autocorr_surface_1.0x.png ({cs}×{cs}, DC suppressed, positive peaks on dark)");
         println!("WP12 → {}", out.display());
+    }
+
+    /// WP15 — whitening explainer (feedback.md §7). Three parts:
+    ///  (a) *whitening as an image* → PNG pair: the centre scale-block and its
+    ///      phase-preserving whitened version (an "extreme clarity" push — what the finder
+    ///      listens to). `whitening_input.png` + `whitening_whitened.png`.
+    ///  (b) *why the finder needs it* → `whitening_profile.csv` (lag, raw, whitened): the
+    ///      mark's tile-period peak buried in the raw autocorrelation vs unmistakable after
+    ///      whitening, on a 1.0× marked capture.
+    ///  (c) *where it fails (the upscale story)* → `whitening_upscale_profile.csv`
+    ///      (lag, full_res, half_pyramid) for a ~1.5× upscaled suspect: the tile peak crowded
+    ///      toward the low-frequency (high-lag) end at full resolution, returning to the clean
+    ///      mid-range at the ½-pyramid level. Peak ranks printed for the caption.
+    #[test]
+    #[ignore]
+    fn wp_whitening() {
+        use image::ColorType;
+        let out = wp_figures_dir();
+
+        let img = image::open(canonical_fixture()).unwrap().into_rgb8();
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let orig_y = extract_y_rgb(&img.into_raw());
+        let mut wm = orig_y.clone();
+        embed_y(&mut wm, w, h, &PHASE3_PAYLOAD);
+
+        // (a) whitening as an image — operate on exactly the block the finder whitens.
+        // The whitened result is heavy-tailed (a few strong edges, mostly flat), so a
+        // max-normalized render washes to gray; scale contrast to ±3σ so the edge/texture
+        // structure (the "clarity push") reads.
+        let (block, sb) = registration::scale_block_of(&wm, w, h);
+        image::save_buffer(out.join("whitening_input.png"), &wp_gray_lin(&block), sb as u32, sb as u32, ColorType::Rgb8).unwrap();
+        let whitened = registration::whiten_block_image(&block, sb);
+        let std = ((whitened.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / whitened.len() as f64).sqrt() as f32).max(1e-12);
+        let wsc = 127.0 / (3.0 * std);
+        let wpx: Vec<u8> = whitened.iter().flat_map(|&v| { let g = (v * wsc + 128.0).clamp(0.0, 255.0) as u8; [g, g, g] }).collect();
+        image::save_buffer(out.join("whitening_whitened.png"), &wpx, sb as u32, sb as u32, ColorType::Rgb8).unwrap();
+        println!("WP15 (a) whitening-as-image ({sb}×{sb}) → whitening_input.png + whitening_whitened.png  (contrast ±3σ)");
+
+        // (b) raw vs whitened lag profile of the 1.0× marked capture. The finder ignores
+        // lag < 24, and the raw autocorr's lag-0 lobe dwarfs everything, so the CSV starts
+        // at lag 24 — the window the finder actually searches — where both curves are legible.
+        const LAG0: usize = 24;
+        let raw = registration::autocorr_lag_profile_raw(&wm, w, h);
+        let whit = registration::autocorr_lag_profile(&wm, w, h);
+        let mut csv = String::from("lag,raw,whitened\n");
+        for lag in LAG0..raw.len().min(whit.len()) { csv.push_str(&format!("{lag},{:.6},{:.6}\n", raw[lag], whit[lag])); }
+        std::fs::write(out.join("whitening_profile.csv"), &csv).unwrap();
+        // The story: in the RAW profile the strongest feature over the searched window is the
+        // image's own broad low-frequency lobe (near LAG0), *not* the tile period (~256), so
+        // the mark is buried; whitening flattens that lobe and the tile-period peak becomes the
+        // global maximum. Report the argmax lag of each — the honest one-number summary.
+        let argmax = |p: &[f32]| (LAG0..p.len()).max_by(|&a, &b| p[a].partial_cmp(&p[b]).unwrap()).unwrap();
+        println!("WP15 (b) raw-vs-whitened lag profile → whitening_profile.csv");
+        println!("     strongest feature (lag≥{LAG0}): raw at lag {} (image's low-frequency lobe) → whitened at lag {} (the tile period; mark surfaces)",
+            argmax(&raw), argmax(&whit));
+
+        // (c) the upscale story. Prefer the *real* sstest51 capture (the "sstest51-class"
+        // upscale the task names — a 1.49× zoomed, re-saved screenshot); it genuinely buries
+        // the tile-period peak at full resolution the way a synthetic clean upscale does not.
+        // Fall back to a synthetic 1.5× upscale if the private capture is absent. The
+        // true-period lag is read from the ½-pyramid profile's own strongest peak (rank #1
+        // there, per the sstest51 investigation), so no decode / hardcoded scale is needed;
+        // the full-res true period is then 2× that lag.
+        let sstest51 = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
+            .join("tests").join("failed_crops").join("sstest51.jpg");
+        let (suspect, cw, ch, source) = if sstest51.exists() {
+            let cap = image::open(&sstest51).unwrap().into_rgb8();
+            let (cw, ch) = (cap.width() as usize, cap.height() as usize);
+            (extract_y_rgb(&cap.into_raw()), cw, ch, "sstest51 (real 1.49× capture)")
+        } else {
+            let (uw, uh) = ((w as f32 * 1.5).round() as usize, (h as f32 * 1.5).round() as usize);
+            (resample_y(&wm, w, h, uw, uh), uw, uh, "synthetic 1.5× upscale (sstest51 absent)")
+        };
+        let (hw, hh) = (cw / 2, ch / 2);
+        let half = resample_y(&suspect, cw, ch, hw, hh);
+        let prof_full = registration::autocorr_lag_profile(&suspect, cw, ch);
+        let prof_half = registration::autocorr_lag_profile(&half, hw, hh);
+        let mut csv = String::from("lag,full_res,half_pyramid\n");
+        for lag in LAG0..prof_full.len().min(prof_half.len()) { csv.push_str(&format!("{lag},{:.6},{:.6}\n", prof_full[lag], prof_half[lag])); }
+        std::fs::write(out.join("whitening_upscale_profile.csv"), &csv).unwrap();
+        // True period = strongest half-pyramid peak (≥ LAG0); full-res period is its 2×.
+        let half_lag = (LAG0..prof_half.len()).max_by(|&a, &b| prof_half[a].partial_cmp(&prof_half[b]).unwrap()).unwrap();
+        let full_lag = (2 * half_lag) as f32;
+        let rank_full = registration::peak_rank_near(&suspect, cw, ch, full_lag, 0.05);
+        let rank_half = registration::peak_rank_near(&half, hw, hh, half_lag as f32, 0.05);
+        let fmt_rank = |r: Option<usize>| r.map(|n| format!("#{n}")).unwrap_or_else(|| "not found".into());
+        println!("WP15 (c) upscale story [{source}] → whitening_upscale_profile.csv");
+        println!("     true-period rank: full-res {} at lag ~{:.0}  ·  ½-pyramid {} at lag {half_lag}  (the finder mis-locks at full res, locks at ½×)",
+            fmt_rank(rank_full), full_lag, fmt_rank(rank_half));
+        println!("WP15 → {}", out.display());
+    }
+
+    /// WP16 — real-capture figure (plan #10, curated to the two human-approved captures in
+    /// `tests/failed_crops/`: sstest51 = a 1.49× zoomed, re-saved screenshot, and its
+    /// downscaled sibling). Copies both into `white_paper/figures/` (making these two — and
+    /// *only* these two — public), blind-decodes each, and prints verdict / recovered scale /
+    /// ECC bits corrected / prominence / wall time for the captions. Reads from
+    /// `failed_crops/` if present (private, gitignored), else the committed `figures/` copy;
+    /// skips gracefully if neither exists (fresh clone without the private inputs).
+    #[test]
+    #[ignore]
+    fn wp_real_capture() {
+        use std::time::Instant;
+        let out = wp_figures_dir();
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("tests").join("failed_crops");
+
+        // (source filename in failed_crops, committed figure filename, caption label)
+        let cases = [
+            ("sstest51.jpg",            "realcap_sstest51.jpg",            "sstest51 (1.49× zoom, re-saved screenshot)"),
+            ("sstest51downscaled.jpg",  "realcap_sstest51downscaled.jpg",  "sstest51 downscaled"),
+        ];
+
+        // Warm the template cache (one-time ~3 s synthesis) so the reported wall times are
+        // steady-state per-decode, not skewed by first-call setup.
+        let mut warmed = false;
+
+        for (src_name, fig_name, label) in cases {
+            let src = src_dir.join(src_name);
+            let fig = out.join(fig_name);
+            // Resolve the input: prefer the private source; publish a copy; else reuse a
+            // committed copy from a prior run.
+            let input = if src.exists() {
+                std::fs::copy(&src, &fig).unwrap_or_else(|e| panic!("copy {src_name} → figures: {e}"));
+                fig.clone()
+            } else if fig.exists() {
+                fig.clone()
+            } else {
+                println!("WP16: {src_name} absent (private capture) and no committed {fig_name} — skipping");
+                continue;
+            };
+
+            let img = image::open(&input).unwrap_or_else(|e| panic!("open {}: {e}", input.display())).into_rgb8();
+            let (iw, ih) = (img.width() as usize, img.height() as usize);
+            let y = extract_y_rgb(&img.into_raw());
+
+            if !warmed { let _ = registration::decode_blind_auto(&y, iw, ih); warmed = true; }
+            let t0 = Instant::now();
+            let r = registration::decode_blind_auto(&y, iw, ih);
+            let secs = t0.elapsed().as_secs_f64();
+
+            let verdict = if r.verified { "verified (CRC ok)" } else { "NOT verified" };
+            let ecc = if r.errors_corrected == 0 { "none (clean)".to_string() } else { format!("{} bit(s)", r.errors_corrected) };
+            println!("WP16 [{label}] {iw}×{ih} → {fig_name}");
+            println!("     {verdict} · scale {:.3} · offset ({},{}) · ECC corrected {ecc} · prominence {:.1} · {:.1} s",
+                r.scale, r.offset.0, r.offset.1, r.confidence, secs);
+        }
+        println!("WP16 → {}", out.display());
     }
 
     /// WP13 — needle vs comb (PN explainer): a PN sequence and an equal-contrast periodic

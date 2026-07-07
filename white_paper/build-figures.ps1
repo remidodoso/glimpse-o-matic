@@ -29,8 +29,14 @@ $emitters = @(
     'wp_band_knockout',     # WP11 — detail-level knockout strip
     'wp_autocorr',          # WP12 — autocorrelation figures (fence + wm profiles + surface)
     'wp_needle_vs_comb',    # WP13 — PN needle vs stripe comb
-    'wp_stereogram'         # WP14 — random-dot autostereogram
+    'wp_stereogram',        # WP14 — random-dot autostereogram
+    'wp_whitening',         # WP15 — whitening: input/whitened PNGs + raw-vs-whitened + upscale CSVs
+    'wp_real_capture'       # WP16 — real-capture blind decodes (sstest51 + downscaled), published
 )
+
+# Note: WP17 (synthetic WebP channel) is intentionally NOT here — WebP encoding is
+# deliberately not part of the framework. Its measurement was produced one-time with a
+# borrowed libwebp encoder and recorded in feedback.md; see the WP17 note there.
 
 foreach ($t in $emitters) {
     Write-Host "== $t ==" -ForegroundColor Cyan

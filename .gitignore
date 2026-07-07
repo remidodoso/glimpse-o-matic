@@ -9,6 +9,9 @@ glimr/pkg/
 # (Real-capture inputs under tests/failed_crops/ stay ignored by this rule.)
 *.jpg
 !tests/fixtures/*.jpg
+# White-paper real-capture figures (WP16): the two human-approved sstest51 captures,
+# published from the otherwise-private tests/failed_crops/ for the paper.
+!white_paper/figures/*.jpg
 
 # Gallery archives — keep Demo.zip (served sample); ignore the rest
 *.zip

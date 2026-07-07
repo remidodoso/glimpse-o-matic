@@ -1211,20 +1211,50 @@
         The name describes the result: a spectrum flattened this way resembles that of white noise, in which every frequency carries equal energy.
         Readers who have met whitening as a data-preprocessing step in machine learning have met this operation: dividing each frequency by its local average is the same variance-equalizing step, carried out in the basis that diagonalizes a stationary signal.
       </p>
+
+      <figure>
+        <img loading="lazy" decoding="async" class="chart" src="figures/chart_whitening.svg" alt="One lag profile before and after whitening: the raw profile is dominated by a low-frequency lobe; the whitened profile peaks at lag 256, the tile period">
+        <figcaption>
+          <span class="figlabel">The peak, surfaced.</span>
+          The same marked image's lag profile before and after whitening, each normalized to its own peak.
+          Raw, the strongest feature is the photograph's own low-frequency bulk, and the watermark's period is invisible on the slope; whitened, the strongest feature is the peak at lag 256 — the tile period, read directly.
+        </figcaption>
+      </figure>
       <p>
         The operation has a familiar relative in photo editing.
         Unsharp masking subtracts a blurred copy of an image from the image itself, boosting fine detail relative to broad shading — a fixed, one-shot version of the same rebalancing.
         Whitening is the adaptive extreme: every frequency is rebalanced against its own neighborhood, and a whitened photograph, viewed as an image, looks like the "clarity" slider pushed to its limit — edges and texture with the smooth shading stripped away.
       </p>
+
+      <figure>
+        <div class="panels">
+          <span class="panel"><img loading="lazy" decoding="async" src="figures/whitening_input.png" alt="The center block of a photograph, as the scale finder receives it" data-caption="The block the scale finder analyzes, before whitening."><span class="panel-label">input block</span></span>
+          <span class="panel"><img loading="lazy" decoding="async" src="figures/whitening_whitened.png" alt="The same block after spectral whitening: smooth shading gone, edges and fine texture remaining" data-caption="The same block whitened — smooth shading stripped away, edges and texture remaining (rendered at ±3σ contrast)."><span class="panel-label">whitened</span></span>
+        </div>
+        <figcaption>
+          <span class="figlabel">Whitening as an image.</span>
+          The block the scale finder analyzes, before and after whitening.
+          The whitened version keeps only what departs from its surroundings — the over-sharpened look the unsharp-masking comparison predicts.
+          It is rendered at ±3σ contrast for visibility.
+        </figcaption>
+      </figure>
       <p>
         Whitening has one blind region, and it is the one that matters to this system.
         Near the lowest frequencies, the smoothing window that estimates the local average is inflated by the image's bulk next door, and the division flattens the watermark's peak along with everything else.
         A peak that drifts into that region is not merely hard to see; the very step that reveals it elsewhere erases it.
         Enlarging an image pushes the peak exactly there — the period grows, the frequency falls — which is why upscaled captures once defeated the scale finder, and why the pyramid remedy of the preceding paragraphs works: shrinking the suspect returns the peak to the clean middle of the spectrum.
       </p>
-      <p class="todo-section">
-        TBD — figures (TODO-WP15): a photograph beside its whitened version; the lag profile of a marked capture with and without whitening; the upscale failure and its pyramid recovery, with the measured peak rankings.
-      </p>
+
+      <figure>
+        <img loading="lazy" decoding="async" class="chart" src="figures/chart_whitening_upscale.svg" alt="Whitened lag profiles of an upscaled capture: at full resolution the true-period peak ranks twenty-first; at the half-pyramid level it is first and exact">
+        <figcaption>
+          <span class="figlabel">The blind region, measured.</span>
+          Whitened lag profiles of the real 1.49×-upscaled capture of <a class="xref" href="#forensic-decode">Forensic Decode</a>, each normalized to its own peak.
+          At full resolution the true period sits at lag 382, deep in the blind region, and its peak ranks twenty-first — the finder locks elsewhere.
+          At the half-pyramid level the same period lands at lag 191, back in the clean mid-range, and ranks first, exactly.
+          One honest detail: a clean synthetic upscale does not reproduce the burial — the effect required the genuine capture, with everything a real screenshot chain does to an image.
+        </figcaption>
+      </figure>
     </article>
     <p>
       <strong class="run-in">Refinements and cost.</strong>
@@ -1266,12 +1296,38 @@
         <tr><td class="l">riley</td><td>JPEG q70</td><td>0.70×</td><td>200 px/edge</td><td>4.4</td><td class="v-warn">ECC ×2</td></tr>
         <tr><td class="l">riley</td><td>JPEG q50</td><td>0.60×</td><td>none</td><td>2.0</td><td class="v-warn">Chase + ECC ×4</td></tr>
         <tr><td class="l">quyen</td><td>JPEG q50</td><td>0.60×</td><td>200 px/edge</td><td>2.5</td><td class="v-fail">not recovered</td></tr>
-        <tr><td class="l">quyen</td><td>WebP</td><td>1.00×</td><td>none</td><td>—</td><td>not yet tested</td></tr>
       </tbody>
     </table>
     <p class="matrix-caption">
       A representative slice of the blind-decode sweep (the full matrix runs 53 captures, 52 recovered).
-      The single failure is the corner case below; WebP saves are a known gap in the synthetic sweep, covered for now only by the real-world capture mentioned above.
+      The single failure is the corner case below; lossy WebP, deliberately absent from the standing sweep, was measured in a one-time run — the next table.
+    </p>
+
+    <p>
+      <strong class="run-in">WebP, measured once.</strong>
+      No WebP encoder lives in the test tree, by choice — JPEG is the dominant casual channel, and the sweep stays lean.
+      The open question was settled instead with a one-time measurement: the sweep's channel (embed, scale, crop) with a lossy WebP re-save spliced in via a borrowed encoder, decoded blind by the production decoder, with the encoder discarded afterward.
+      Six of seven cells verified.
+    </p>
+
+    <table class="matrix">
+      <thead>
+        <tr><th>image</th><th>scale</th><th>crop</th><th>WebP q</th><th>prom.</th><th>recovered?</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="l">quyen</td><td>1.00×</td><td>none</td><td>90</td><td>6.6</td><td class="v-clean">clean</td></tr>
+        <tr><td class="l">quyen</td><td>0.50×</td><td>none</td><td>80</td><td>3.3</td><td class="v-warn">ECC ×3</td></tr>
+        <tr><td class="l">quyen</td><td>0.66×</td><td>60 px/edge</td><td>80</td><td>2.0</td><td class="v-warn">ECC ×1</td></tr>
+        <tr><td class="l">quyen</td><td>1.20×</td><td>none</td><td>80</td><td>2.7</td><td class="v-warn">ECC ×3</td></tr>
+        <tr><td class="l">riley</td><td>1.00×</td><td>none</td><td>90</td><td>7.3</td><td class="v-clean">clean</td></tr>
+        <tr><td class="l">riley</td><td>0.90×</td><td>none</td><td>80</td><td>2.9</td><td class="v-warn">ECC ×1</td></tr>
+        <tr><td class="l">riley</td><td>0.60×</td><td>none</td><td>75</td><td>1.7</td><td class="v-fail">not recovered</td></tr>
+      </tbody>
+    </table>
+    <p class="matrix-caption">
+      The one-time lossy-WebP measurement (2026-07-07, libwebp 1.6.0; not a regenerable part of the standing sweep).
+      WebP behaves like JPEG: clean at native size and high quality, one to three bits corrected through downscale, crop, and upscale, and the lone failure is the same flat-background, heavy-downscale, low-quality cell that needed the soft-decision rescue on the JPEG sweep.
+      The measurement corroborates the real social-network recovery reported in <a class="xref" href="#forensic-decode">Forensic Decode</a>.
     </p>
 
     <p>
@@ -1484,8 +1540,21 @@
   <p>
     Real captures ground the machinery.
     A 1.49×-zoomed, cropped, re-saved screenshot — found in the wild during development — decodes blind and verifies, the case that motivated the pyramid search.
-    A copy uploaded to a social network, transcoded to WebP by its pipeline, and downloaded again also verified, with the error correction absorbing three flipped bits; that capture's provenance is lost, so the paper reports it as experience rather than exhibit, and the standing sweep's WebP measurement stands in as the reproducible evidence.
+    A copy uploaded to a social network, transcoded to WebP by its pipeline, and downloaded again also verified, with the error correction absorbing three flipped bits; that capture's provenance is lost, so the paper reports it as experience rather than exhibit, corroborated by a one-time synthetic WebP measurement in <a class="xref" href="#robustness">Robustness &amp; Limits</a>.
   </p>
+
+  <figure>
+    <div class="panels">
+      <span class="panel"><img loading="lazy" decoding="async" src="figures/realcap_sstest51.jpg" alt="A zoomed-in, cropped, re-saved screenshot found during development" data-caption="The wild capture: a 1.49×-zoomed, cropped, re-saved screenshot. Verified blind — scale 1.493 recovered, no correction needed, 13.1 s."><span class="panel-label">1.49× zoom — verified</span></span>
+      <span class="panel"><img loading="lazy" decoding="async" src="figures/realcap_sstest51downscaled.jpg" alt="The same capture downscaled by half" data-caption="The same capture at half size. Verified blind at scale 0.747, no correction needed, 2.2 s."><span class="panel-label">half size — verified</span></span>
+    </div>
+    <figcaption>
+      <span class="figlabel">The wild capture, and its half-size sibling.</span>
+      The screenshot that motivated the pyramid search, decoded blind by the production decoder.
+      Left: the capture as found — zoomed to 1.49×, cropped, re-saved — verified with the scale recovered as 1.493, prominence 4.4, no error correction needed, in 13.1 seconds (the upscale pays the full pyramid-and-refine walk).
+      Right: the same capture at half size, verified at scale 0.747, prominence 3.6, in 2.2 seconds.
+    </figcaption>
+  </figure>
 
   <figure class="single">
     <pre><code>sstest32.jpg
@@ -1549,9 +1618,6 @@
     The portrait screenshot in <a class="xref" href="#viewer-ui">The Viewer UI</a> is an ordinary, untouched capture of the viewer — the photograph displayed at fit scale, the carousel and interface chrome included in the frame.
     The committed figure, fed to the decoder, verifies: the scale comes back as 0.496, the tile offset is recovered, the checksum passes at confidence 4.0, and the payload carries a timestamp from the viewing session in which the capture was made.
     The interface chrome surrounding the photograph costs only signal area; unmarked content correlates to approximately nothing against the keyed patterns (see <a class="xref" href="#explainer-pn">Explainer: PN</a>).
-  </p>
-  <p class="todo-section">
-    TBD — figure (TODO-WP16): the sstest51 capture pair with decode verdicts and numbers. TBD — sweep numbers (TODO-WP17): synthetic WebP column to cite alongside the anecdote above.
   </p>
   <p>
     Attribution today ends at the gallery and session; a planned tool, <code>packclient</code>, extends it to client deliverables — baking a distinct mark into each delivered set and keeping a manifest mapping payloads to clients, so that a leaked deliverable is attributable with the same decoder.

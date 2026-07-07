@@ -437,7 +437,7 @@ treatment; emitters shouldn't care — they just write full-res PNGs + stdout nu
 emitters in `watermark.rs`, `--release`, deterministic, output → `white_paper/figures/`,
 numbers to stdout for captions, add to `build-figures.ps1`).*
 
-- [ ] **TODO-WP15 — Whitening figures (for the new *Explainer: Whitening*; absorbs plan #7,
+- [x] **TODO-WP15 — Whitening figures (for the new *Explainer: Whitening*; absorbs plan #7,
   the scale-story figure).** Three parts.
   (a) *Whitening as an image*: a fixture and its spectrally-whitened version side by side —
   the whitened image should read as edges/fine texture, visually akin to an extreme
@@ -450,19 +450,78 @@ numbers to stdout for captions, add to `build-figures.ps1`).*
   peak crowded against the low-frequency end and flattened, next to the ½-pyramid level of
   the same suspect where the peak returns to the clean mid-range. Caption data: the measured
   peak ranking (~#32 at full res, #1 and exact at ½× on the sstest51-class capture).
-- [ ] **TODO-WP16 — Real-capture figure (plan #10, curated).** From `tests/failed_crops/`:
+- [x] **TODO-WP16 — Real-capture figure (plan #10, curated).** From `tests/failed_crops/`:
   **sstest51** (the 1.49× zoomed, re-saved screenshot) and **sstest51downscaled** — the human
   has confirmed these two, and *only* these two, as publishable; don't emit others. Copy them
   (or display-ready versions) to `white_paper/figures/` and run the blind decoder on each,
   printing verdict, recovered scale, raw bit errors / ECC use, prominence, and wall time for
   the captions.
-- [ ] **TODO-WP17 — Synthetic WebP column in the sweep.** Add a WebP re-save channel to
-  `blind_auto_sweep` (or a small dedicated run) so the robustness table's "WebP — not yet
-  tested" row becomes a measurement; print per-cell outcomes like the JPEG cells. The real
-  Bluesky capture's provenance is lost, so the paper will report the synthetic measurement
-  plus the real recovery as a stated (unillustrated) anecdote. Encoder choice is the
-  implementer's (dev-dependency only is fine); this supersedes the earlier "WebP deferred"
-  call *for figure purposes only* — no production behavior change.
+- [x] **TODO-WP17 — Synthetic WebP column (one-off; *not* wired into the sweep).** Add a WebP
+  re-save channel so the robustness table's "WebP — not yet tested" row becomes a measurement;
+  print per-cell outcomes like the JPEG cells. The real Bluesky capture's provenance is lost, so
+  the paper reports the synthetic measurement plus the real recovery as a stated (unillustrated)
+  anecdote. **Human scoping call (2026-07-07):** WebP encoding is *deliberately* absent from the
+  test framework and stays that way — the borrowed encoder was used one-time to produce the
+  numbers below, leaving **no** WebP scaffolding in the tree (the sweep's `w<NN>` cells still skip,
+  by design). Results are recorded here (see the WP17 measurement block below) rather than in a
+  regenerable emitter.
+
+**Pair-session status (2026-07-07) — WP15–WP17 done.** WP15/WP16 are new `wp_*` `#[ignore]`
+emitters in `glimr/src/watermark.rs`, added to `build-figures.ps1` (`wp_whitening`,
+`wp_real_capture`). New `registration` helpers (all native/`registration`-gated): `scale_block_of`,
+`whiten_block_image` (phase-preserving spectral whitening → a viewable image), `autocorr_raw` +
+`autocorr_lag_profile_raw` (un-whitened profile, apples-to-apples with the whitened one), and
+`peak_rank_near` (rank of the true-period peak). WP17 was a throwaway run (borrowed libwebp
+`cwebp`/`dwebp` via a `CWEBP` env var; `cwebp -q` → WebP → `dwebp` → PNG → existing pure-Rust
+decode), since deleted — no permanent WebP dependency added. Conventions honored: deterministic
+(WM_KEY + PHASE3_PAYLOAD), no production defaults touched.
+
+**WP15 caption data (quyen canonical; `whitening_*` in `white_paper/figures/`):**
+- **(a)** `whitening_input.png` + `whitening_whitened.png` (1024×1024 centre scale-block and its
+  phase-preserving whitened version; whitened rendered at ±3σ contrast). The whitened frame reads as
+  an extreme unsharp-mask/"clarity" push — flats suppressed, edges/fine texture lifted.
+- **(b)** `whitening_profile.csv` (`lag,raw,whitened`, lag ≥ 24 = the finder's search floor). The
+  raw profile's strongest feature sits at **lag 24** (the image's own low-frequency lobe); after
+  whitening the strongest feature is at **lag 256** — the mark's tile period surfaces. *(This is the
+  scale-finder-in-one-chart; render as SVG.)*
+- **(c)** `whitening_upscale_profile.csv` (`lag,full_res,half_pyramid`) — generated from the **real
+  sstest51** capture (a synthetic clean 1.5× upscale does *not* bury the peak, so the emitter uses
+  the genuine article; falls back to synthetic if the private file is absent). True-period rank:
+  **full-res #21 at lag ~382 → ½-pyramid #1 at lag 191.** The full-res finder mis-locks (peak
+  crowded toward the low-frequency / high-lag end); the ½-pyramid recovers it exactly. *(Matches the
+  notes' "~#32 at full res, #1 at ½×" story on this file class.)*
+
+**WP16 caption data (published to `white_paper/figures/`; `.gitignore` exception added so the two
+approved captures commit despite the global `*.jpg` ignore):**
+- `realcap_sstest51.jpg` (1591×1694, the 1.49× zoomed re-saved screenshot): **verified (CRC ok)** ·
+  recovered scale **1.493** · offset (388,20) · **ECC: none (clean)** · prominence **4.4** · **13.1 s**
+  (the upscale case pays the deep-pyramid + refine walk).
+- `realcap_sstest51downscaled.jpg` (796×848): **verified (CRC ok)** · recovered scale **0.747** ·
+  **ECC: none (clean)** · prominence **3.6** · **2.2 s**.
+  (Wall times are steady-state — the template cache is warmed before timing. First-call template
+  synthesis is a separate one-time ~3 s.)
+
+**WP17 measurement — synthetic lossy-WebP channel (one-off, 2026-07-07).** Channel mirrors the
+`blind_auto_sweep` exactly (embed in RGB → scale → crop) with a lossy WebP hop added via libwebp
+1.6.0 `cwebp -q` (then `dwebp` back to PNG for decode). Production blind decoder, no scale/crop hint.
+**6 / 7 CRC-verified:**
+
+| fixture | scale | crop (L:T:R:B) | webp q | result | rec. scale | ECC | prom |
+|---|---|---|---|---|---|---|---|
+| quyen | 1.00 | none | 90 | **CRC ✓** | 1.000 | clean | 6.6 |
+| quyen | 0.50 | none | 80 | **CRC ✓** | 0.500 | fixed 3 | 3.3 |
+| quyen | 0.66 | 60:60:60:60 | 80 | **CRC ✓** | 0.660 | fixed 1 | 2.0 |
+| quyen | 1.20 | none | 80 | **CRC ✓** | 1.202 | fixed 3 | 2.7 |
+| riley | 1.00 | none | 90 | **CRC ✓** | 1.000 | clean | 7.3 |
+| riley | 0.90 | none | 80 | **CRC ✓** | 0.901 | fixed 1 | 2.9 |
+| riley | 0.60 | none | 75 | **CRC ✗** | 0.601 | — | 1.7 |
+
+Reading: lossy WebP behaves like JPEG — clean at native/high quality, ECC absorbs 1–3 bit errors
+through downscale/crop/upscale, and the **one failure is the known flat-background (riley) +
+heavy-downscale + low-quality cliff** (the same cell that needed a Chase rescue on the JPEG sweep).
+So the synthetic measurement corroborates the real Bluesky-WebP recovery anecdote: **WebP preserves
+the mark comparably to JPEG, with the same content-dependent cliff.** *(This block is the WP17
+deliverable; there is no regenerable emitter — the sweep's WebP row remains deliberately skipped.)*
 
 ## 8. Priority view (insight per hour)
 
@@ -628,7 +687,7 @@ full-frame version stays as the lightbox click-through. See WP9-inset / WP6-inse
     as a heatmap (the tile lattice made visible). Raster is right here (it's an image).
   - **(a, optional, needs a periodic photo)** — if a brick-wall / picket-fence shot is available
     (the human may provide one), emit its lag-profile CSV + the photo; otherwise skip — (b) carries
-    the explainer on its own.
+    the explainer on its own. -- HUMAN UPDATE: No brick wall/picket fence photo is available
 - [ ] **WP13 — needle vs comb (raster tiles + CSV profiles).**
   - Rasters: a noise tile and a striped tile of equal contrast (~256–512²): `pn_tile_demo.png`,
     `stripe_tile_demo.png`.
