@@ -1,0 +1,45 @@
+<svg class="wpchart" viewBox="0 0 720 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Strength α: decode margin vs. perceptual cost">
+<style>.wpchart text{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;}.t{fill:#8c8475;font-size:13px;}.tl{fill:#8c8475;font-size:12px;}.ti{font-size:14px;font-weight:600;}</style>
+<text class="t ti" x="56" y="14">Strength α: decode margin vs. perceptual cost</text>
+<line x1="56" y1="294.0" x2="702" y2="294.0" stroke="#9c9488" stroke-width="1" opacity="0.22"/>
+<text class="tl" x="48" y="298.0" text-anchor="end" fill="#b9802f">0</text>
+<line x1="56" y1="184.4" x2="702" y2="184.4" stroke="#9c9488" stroke-width="1" opacity="0.22"/>
+<text class="tl" x="48" y="188.4" text-anchor="end" fill="#b9802f">1</text>
+<line x1="56" y1="74.8" x2="702" y2="74.8" stroke="#9c9488" stroke-width="1" opacity="0.22"/>
+<text class="tl" x="48" y="78.8" text-anchor="end" fill="#b9802f">2</text>
+<text class="tl" x="710" y="298.0" fill="#5b8a90">30</text>
+<text class="tl" x="710" y="212.4" fill="#5b8a90">40</text>
+<text class="tl" x="710" y="126.8" fill="#5b8a90">50</text>
+<text class="tl" x="710" y="41.1" fill="#5b8a90">60</text>
+<line x1="200.8" y1="20" x2="200.8" y2="294" stroke="#9c9488" stroke-width="1" stroke-dasharray="4 4" opacity="0.6"/>
+<text class="tl" x="204.8" y="288.0">α=0.15 (production)</text>
+<polyline fill="none" stroke="#b9802f" stroke-width="1.8" points="56.0,285.6 89.4,273.7 122.8,260.7 156.2,247.7 200.8,230.3 278.8,199.9 423.6,143.4 702.0,34.8"/>
+<polyline fill="none" stroke="#5b8a90" stroke-width="1.8" points="56.0,26.8 89.4,94.9 122.8,129.9 156.2,153.5 200.8,176.7 278.8,205.1 423.6,239.6 702.0,279.8"/>
+<circle cx="56.0" cy="285.6" r="2.6" fill="#b9802f"/>
+<circle cx="89.4" cy="273.7" r="2.6" fill="#b9802f"/>
+<circle cx="122.8" cy="260.7" r="2.6" fill="#b9802f"/>
+<circle cx="156.2" cy="247.7" r="2.6" fill="#b9802f"/>
+<circle cx="200.8" cy="230.3" r="2.6" fill="#b9802f"/>
+<circle cx="278.8" cy="199.9" r="2.6" fill="#b9802f"/>
+<circle cx="423.6" cy="143.4" r="2.6" fill="#b9802f"/>
+<circle cx="702.0" cy="34.8" r="2.6" fill="#b9802f"/>
+<circle cx="56.0" cy="26.8" r="2.6" fill="#5b8a90"/>
+<circle cx="89.4" cy="94.9" r="2.6" fill="#5b8a90"/>
+<circle cx="122.8" cy="129.9" r="2.6" fill="#5b8a90"/>
+<circle cx="156.2" cy="153.5" r="2.6" fill="#5b8a90"/>
+<circle cx="200.8" cy="176.7" r="2.6" fill="#5b8a90"/>
+<circle cx="278.8" cy="205.1" r="2.6" fill="#5b8a90"/>
+<circle cx="423.6" cy="239.6" r="2.6" fill="#5b8a90"/>
+<circle cx="702.0" cy="279.8" r="2.6" fill="#5b8a90"/>
+<text class="tl" x="89.4" y="312" text-anchor="middle">0.05</text>
+<text class="tl" x="200.8" y="312" text-anchor="middle">0.15</text>
+<text class="tl" x="423.6" y="312" text-anchor="middle">0.35</text>
+<text class="tl" x="702.0" y="312" text-anchor="middle">0.60</text>
+<line x1="56" y1="20" x2="56" y2="294" stroke="#9c9488" stroke-width="1"/>
+<line x1="56" y1="294" x2="702" y2="294" stroke="#9c9488" stroke-width="1"/>
+<text class="t" x="379.0" y="332" text-anchor="middle">embedding strength α</text>
+<line x1="70" y1="36" x2="92" y2="36" stroke="#b9802f" stroke-width="3"/>
+<text class="tl" x="98" y="40">decode margin (left)</text>
+<line x1="70" y1="54" x2="92" y2="54" stroke="#5b8a90" stroke-width="3"/>
+<text class="tl" x="98" y="58">PSNR dB (right)</text>
+</svg>

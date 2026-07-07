@@ -1,0 +1,55 @@
+<svg viewBox="0 0 760 168" xmlns="http://www.w3.org/2000/svg" role="img"
+     aria-label="The watermark pipeline, from browser embed to CRC verdict">
+  <style>
+    .box { fill: none; stroke: #9c9488; stroke-width: 1.5; }
+    .box.end { stroke: #b9802f; stroke-width: 2; }
+    .t { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; fill: #6f675a; font-size: 12.5px; }
+    .arr { stroke: #9c9488; stroke-width: 1.5; fill: none; }
+    .ah { fill: #9c9488; }
+    .cap { fill: #8c8475; font-size: 12px; }
+  </style>
+
+  <!-- 6 boxes, single row -->
+  <!-- geometry: x0=14, w=108, gap=14, y=44, h=72 -->
+  <g>
+    <rect class="box" x="14"  y="44" width="108" height="72" rx="7"/>
+    <text class="t" x="68"  y="74" text-anchor="middle">Embed</text>
+    <text class="t" x="68"  y="92" text-anchor="middle">in browser</text>
+
+    <rect class="box" x="136" y="44" width="108" height="72" rx="7"/>
+    <text class="t" x="190" y="74" text-anchor="middle">Display</text>
+    <text class="t" x="190" y="92" text-anchor="middle">&amp; zoom</text>
+
+    <rect class="box" x="258" y="44" width="108" height="72" rx="7"/>
+    <text class="t" x="312" y="68" text-anchor="middle">Screenshot</text>
+    <text class="t" x="312" y="86" text-anchor="middle">(scale</text>
+    <text class="t" x="312" y="102" text-anchor="middle">+ crop)</text>
+
+    <rect class="box" x="380" y="44" width="108" height="72" rx="7"/>
+    <text class="t" x="434" y="74" text-anchor="middle">Re-encode</text>
+    <text class="t" x="434" y="92" text-anchor="middle">(JPEG / WebP)</text>
+
+    <rect class="box" x="502" y="44" width="108" height="72" rx="7"/>
+    <text class="t" x="556" y="74" text-anchor="middle">Blind</text>
+    <text class="t" x="556" y="92" text-anchor="middle">decode</text>
+
+    <rect class="box end" x="624" y="44" width="120" height="72" rx="7"/>
+    <text class="t" x="684" y="68" text-anchor="middle">Payload +</text>
+    <text class="t" x="684" y="86" text-anchor="middle">CRC verdict</text>
+    <text class="t" x="684" y="104" text-anchor="middle" fill="#b9802f">✓ / ✗</text>
+  </g>
+
+  <!-- arrows between boxes -->
+  <g>
+    <line class="arr" x1="123" y1="80" x2="134" y2="80"/><path class="ah" d="M134 80 l-7 -3.5 v7 z"/>
+    <line class="arr" x1="245" y1="80" x2="256" y2="80"/><path class="ah" d="M256 80 l-7 -3.5 v7 z"/>
+    <line class="arr" x1="367" y1="80" x2="378" y2="80"/><path class="ah" d="M378 80 l-7 -3.5 v7 z"/>
+    <line class="arr" x1="489" y1="80" x2="500" y2="80"/><path class="ah" d="M500 80 l-7 -3.5 v7 z"/>
+    <line class="arr" x1="611" y1="80" x2="622" y2="80"/><path class="ah" d="M622 80 l-7 -3.5 v7 z"/>
+  </g>
+
+  <text class="t cap" x="14" y="138">In the gallery</text>
+  <text class="t cap" x="14" y="154">(per view)</text>
+  <text class="t cap" x="744" y="138" text-anchor="end">Offline, on the recovered copy</text>
+  <text class="t cap" x="744" y="154" text-anchor="end">(forensic decode)</text>
+</svg>

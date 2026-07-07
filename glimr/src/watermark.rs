@@ -721,6 +721,7 @@ fn embed_in_subband(
     r0: usize, r1: usize, c0: usize, c1: usize,
     bits:   &[bool; PAYLOAD_BITS],
     gain:   &[f32], gsh: usize, gsw: usize,
+    alpha:  f32,
 ) {
     let tile_len = TILE_SIDE * TILE_SIDE;
     // Build weighted sum of all PN tiles: weighted[t] = Σ_b ( sign_b · pn_b[t] )
@@ -738,7 +739,7 @@ fn embed_in_subband(
             let gj = (col - c0).min(gsw - 1);
             let ti = ((row - r0) % TILE_SIDE) * TILE_SIDE + (col - c0) % TILE_SIDE;
             let g  = gain[gi * gsw + gj];
-            data[row * stride + col] += ALPHA * g * weighted[ti];
+            data[row * stride + col] += alpha * g * weighted[ti];
         }
     }
 }
@@ -841,6 +842,14 @@ pub fn embed_y(y: &mut [f32], width: usize, height: usize, payload: &[u8; DATA_B
 /// (0 = uniform, 1 = full). Exposed so experiments can compare masked vs uniform
 /// embedding (e.g. its effect on the watermark's self-synchronizing periodicity).
 pub fn embed_y_masked(y: &mut [f32], width: usize, height: usize, payload: &[u8; DATA_BYTES], mask_strength: f32) {
+    embed_y_alpha(y, width, height, payload, ALPHA, mask_strength);
+}
+
+/// Like `embed_y_masked` but with an explicit global embedding strength `alpha` instead
+/// of the `ALPHA` const. Production embeds via `embed_y_masked` (alpha = ALPHA, byte-for-
+/// byte unchanged); figure/experiment code varies `alpha` (e.g. the WP1 Goldilocks sweep)
+/// without touching the production default.
+pub fn embed_y_alpha(y: &mut [f32], width: usize, height: usize, payload: &[u8; DATA_BYTES], alpha: f32, mask_strength: f32) {
     dwt_2d_fwd(y, width, height, DECOMP_DEPTH);
     let bits = payload_to_bits(&full_payload(payload)); // data + CRC + reserved-ECC → 192 bits
     for &level in EMBED_LEVELS {
@@ -849,7 +858,7 @@ pub fn embed_y_masked(y: &mut [f32], width: usize, height: usize, payload: &[u8;
         for &band in &[Subband::LH, Subband::HL] {
             let (r0, r1, c0, c1) = subband_bounds(width, height, level, band);
             if r1 > r0 && c1 > c0 {
-                embed_in_subband(y, width, r0, r1, c0, c1, &bits, &gain, gsh, gsw);
+                embed_in_subband(y, width, r0, r1, c0, c1, &bits, &gain, gsh, gsw, alpha);
             }
         }
     }
@@ -1106,6 +1115,28 @@ pub mod registration {
         peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         peaks.truncate(top_k);
         peaks
+    }
+
+    /// Whitened-autocorrelation 1D lag profile (per-lag max of the horizontal/vertical
+    /// directions, from lag 0) — the curve `scale_peaks` finds its peaks in. Exposed for the
+    /// white-paper autocorrelation figures (WP12): the watermark's tile-period peak sits at
+    /// ~256·scale.
+    pub fn autocorr_lag_profile(y: &[f32], w: usize, h: usize) -> Vec<f32> {
+        let mut planner = FftPlanner::<f32>::new();
+        let sb = SCALE_BLOCK.min(w).min(h);
+        let blk = extract(y, w, (w - sb) / 2, (h - sb) / 2, sb);
+        let ac = autocorr_whitened(&blk, sb, &mut planner);
+        let n = 2 * sb; let c = sb;
+        (0..sb).map(|lag| ac[c * n + c + lag].max(ac[(c + lag) * n + c])).collect()
+    }
+
+    /// Full 2D whitened-autocorr surface of the centre block; returns (values, side = 2·sb).
+    /// Exposed for WP12(c) — the periodic tile lattice made visible.
+    pub fn autocorr_surface(y: &[f32], w: usize, h: usize) -> (Vec<f32>, usize) {
+        let mut planner = FftPlanner::<f32>::new();
+        let sb = SCALE_BLOCK.min(w).min(h);
+        let blk = extract(y, w, (w - sb) / 2, (h - sb) / 2, sb);
+        (autocorr_whitened(&blk, sb, &mut planner), 2 * sb)
     }
 
     /// Per-bit spatial templates: pn_b tiled into the embed bands (LH/HL at
@@ -1907,6 +1938,791 @@ mod tests {
         }
     }
 
+    // ── White-paper figure emitters (WP-series; see feedback.md §7) ─────────────
+    // Deterministic (fixed WM_KEY + PHASE3_PAYLOAD), `#[ignore]`, run `--release`.
+    // Output → white_paper/figures/. Image-derived figures keep the source resolution;
+    // synthetic tiles are nearest-neighbor upscaled to WP_FIG_LONG so the pattern stays
+    // crisp. No production defaults are touched. Regenerate via build-figures.ps1 (WP8).
+
+    fn wp_figures_dir() -> std::path::PathBuf {
+        let d = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().join("white_paper").join("figures");
+        std::fs::create_dir_all(&d).ok();
+        d
+    }
+
+    /// Long-edge target (px) for synthetic, non-image figures (PN tiles, templates).
+    const WP_FIG_LONG: usize = 1024;
+
+    /// Nearest-neighbor resize of an f32 plane — keeps hard edges, so an upscaled PN
+    /// tile reads as crisp blocks rather than a blurred smear.
+    fn nn_resize(src: &[f32], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; dw * dh];
+        for dy in 0..dh {
+            let sy = (dy * sh / dh).min(sh - 1);
+            for dx in 0..dw {
+                let sx = (dx * sw / dw).min(sw - 1);
+                out[dy * dw + dx] = src[sy * sw + sx];
+            }
+        }
+        out
+    }
+
+    /// Upscale a small tile so its long edge is WP_FIG_LONG (nearest-neighbor),
+    /// preserving aspect. Returns (pixels, w, h).
+    fn wp_upscale(src: &[f32], sw: usize, sh: usize) -> (Vec<f32>, usize, usize) {
+        let long = sw.max(sh).max(1);
+        let (dw, dh) = (sw * WP_FIG_LONG / long, sh * WP_FIG_LONG / long);
+        (nn_resize(src, sw, sh, dw, dh), dw, dh)
+    }
+
+    /// Map a signed f32 plane to 8-bit gray (as RGB triplets), centered at 128 so 0 is
+    /// mid-gray and ±peak spans the full range. Returns (rgb, peak) — peak for captions.
+    fn wp_gray_signed(data: &[f32]) -> (Vec<u8>, f32) {
+        let peak = data.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-12);
+        let scale = 127.0 / peak;
+        let rgb = data.iter().flat_map(|&v| {
+            let g = (v * scale + 128.0).clamp(0.0, 255.0) as u8;
+            [g, g, g]
+        }).collect();
+        (rgb, peak)
+    }
+
+    /// Draw a `thick`-px rectangle outline of `color` on an RGB buffer (for WP4 band marks).
+    fn wp_draw_rect(rgb: &mut [u8], w: usize, r0: usize, r1: usize, c0: usize, c1: usize, color: [u8; 3], thick: usize) {
+        let put = |rgb: &mut [u8], r: usize, c: usize| {
+            let i = (r * w + c) * 3; rgb[i] = color[0]; rgb[i + 1] = color[1]; rgb[i + 2] = color[2];
+        };
+        for t in 0..thick {
+            if r0 + t < r1 { for c in c0..c1 { put(rgb, r0 + t, c); } }
+            if r1 > t + 1 && r1 - 1 - t >= r0 { for c in c0..c1 { put(rgb, r1 - 1 - t, c); } }
+            if c0 + t < c1 { for r in r0..r1 { put(rgb, r, c0 + t); } }
+            if c1 > t + 1 && c1 - 1 - t >= c0 { for r in r0..r1 { put(rgb, r, c1 - 1 - t); } }
+        }
+    }
+
+    /// Diverging blue→white→red heat ramp (for WP5; gain is mean-1, so blue = suppressed,
+    /// red = boosted). `t` in [0,1].
+    fn wp_heat(t: f32) -> [u8; 3] {
+        let t = t.clamp(0.0, 1.0);
+        let r = t;
+        let b = 1.0 - t;
+        let g = 1.0 - (2.0 * t - 1.0).abs();
+        [(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8]
+    }
+
+    // ── Test-only Haar wavelet (WP6) ────────────────────────────────────────────
+    // Exact-round-trip Haar via lifting, matching the production DWT's even/odd
+    // deinterleave + lo_len layout so subband_bounds / embed_in_subband apply unchanged.
+    // Used only to render the Haar-vs-CDF5/3 residual texture comparison.
+    fn haar_1d_fwd(buf: &mut [f32], n: usize) {
+        if n < 2 { return; }
+        let mut k = 1; while k < n { buf[k] -= buf[k - 1]; k += 2; }                 // d = odd − left even
+        let mut k = 0; while k < n { if k + 1 < n { buf[k] += 0.5 * buf[k + 1]; } k += 2; } // s = even + d/2
+        let lo = lo_len(n);
+        let mut tmp = vec![0f32; n];
+        let (mut e, mut o) = (0usize, lo);
+        for i in 0..n { if i & 1 == 0 { tmp[e] = buf[i]; e += 1; } else { tmp[o] = buf[i]; o += 1; } }
+        buf[..n].copy_from_slice(&tmp[..n]);
+    }
+    fn haar_1d_inv(buf: &mut [f32], n: usize) {
+        if n < 2 { return; }
+        let lo = lo_len(n);
+        let mut tmp = vec![0f32; n];
+        let (mut e, mut o) = (0usize, lo);
+        for i in 0..n { if i & 1 == 0 { tmp[i] = buf[e]; e += 1; } else { tmp[i] = buf[o]; o += 1; } }
+        buf[..n].copy_from_slice(&tmp[..n]);
+        let mut k = 0; while k < n { if k + 1 < n { buf[k] -= 0.5 * buf[k + 1]; } k += 2; }
+        let mut k = 1; while k < n { buf[k] += buf[k - 1]; k += 2; }
+    }
+    fn haar_apply(data: &mut [f32], stride: usize, w: usize, h: usize, fwd: bool, rows: bool) {
+        if rows {
+            let mut r = vec![0f32; w];
+            for rr in 0..h {
+                let b = rr * stride; r[..w].copy_from_slice(&data[b..b + w]);
+                if fwd { haar_1d_fwd(&mut r, w); } else { haar_1d_inv(&mut r, w); }
+                data[b..b + w].copy_from_slice(&r[..w]);
+            }
+        } else {
+            let mut col = vec![0f32; h];
+            for cc in 0..w {
+                for rr in 0..h { col[rr] = data[rr * stride + cc]; }
+                if fwd { haar_1d_fwd(&mut col, h); } else { haar_1d_inv(&mut col, h); }
+                for rr in 0..h { data[rr * stride + cc] = col[rr]; }
+            }
+        }
+    }
+    fn haar_2d_fwd(data: &mut [f32], width: usize, height: usize, levels: u32) {
+        let (mut w, mut h) = (width, height);
+        for _ in 0..levels {
+            if w < 2 || h < 2 { break; }
+            haar_apply(data, width, w, h, true, true);
+            haar_apply(data, width, w, h, true, false);
+            w = lo_len(w); h = lo_len(h);
+        }
+    }
+    fn haar_2d_inv(data: &mut [f32], width: usize, height: usize, levels: u32) {
+        let mut sizes = Vec::new();
+        let (mut w, mut h) = (width, height);
+        for _ in 0..levels { if w < 2 || h < 2 { break; } sizes.push((w, h)); w = lo_len(w); h = lo_len(h); }
+        for &(w, h) in sizes.iter().rev() {
+            haar_apply(data, width, w, h, false, false);
+            haar_apply(data, width, w, h, false, true);
+        }
+    }
+
+    /// Grayscale (RGB triplets) from intensity f32 values, clamped to [0,255] — for the
+    /// reconstruction figures (WP10/WP11) whose values are already in pixel range.
+    fn wp_gray_lin(data: &[f32]) -> Vec<u8> {
+        data.iter().flat_map(|&v| { let g = v.clamp(0.0, 255.0) as u8; [g, g, g] }).collect()
+    }
+
+    /// Zero all but the largest-magnitude `frac` fraction of `vals` (in place); returns the
+    /// kept count. Used by the sparsity strip (WP10).
+    fn wp_keep_top_fraction(vals: &mut [f32], frac: f32) -> usize {
+        let keep = (((vals.len() as f32) * frac).round() as usize).clamp(1, vals.len());
+        let mut mags: Vec<f32> = vals.iter().map(|v| v.abs()).collect();
+        mags.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        let thresh = mags[keep - 1];
+        let mut kept = 0usize;
+        for v in vals.iter_mut() { if v.abs() >= thresh { kept += 1; } else { *v = 0.0; } }
+        kept
+    }
+
+    /// Normalized 1D autocorrelation (zero-meaned, ÷ lag-0 energy) for lags 0..max_lag —
+    /// the "slide against itself" agreement profile (WP12a / WP13).
+    fn wp_autocorr_1d(sig: &[f32], max_lag: usize) -> Vec<f32> {
+        let n = sig.len();
+        let mean = sig.iter().sum::<f32>() / n.max(1) as f32;
+        let s: Vec<f32> = sig.iter().map(|v| v - mean).collect();
+        let denom = s.iter().map(|v| v * v).sum::<f32>().max(1e-9);
+        (0..max_lag.min(n)).map(|lag| {
+            let mut acc = 0.0f32;
+            for i in 0..(n - lag) { acc += s[i] * s[i + lag]; }
+            acc / denom
+        }).collect()
+    }
+
+    /// Separable 2D FFT (rows then cols), in place; rustfft's inverse is unnormalized.
+    /// Gated — only WP10's FFT-sparsity column uses it.
+    #[cfg(feature = "registration")]
+    fn wp_fft2d(buf: &mut [rustfft::num_complex::Complex<f32>], w: usize, h: usize,
+                planner: &mut rustfft::FftPlanner<f32>, inverse: bool) {
+        use rustfft::num_complex::Complex;
+        let fr = if inverse { planner.plan_fft_inverse(w) } else { planner.plan_fft_forward(w) };
+        for r in 0..h { fr.process(&mut buf[r * w..(r + 1) * w]); }
+        let fc = if inverse { planner.plan_fft_inverse(h) } else { planner.plan_fft_forward(h) };
+        let mut col = vec![Complex::new(0.0f32, 0.0); h];
+        for c in 0..w {
+            for r in 0..h { col[r] = buf[r * w + c]; }
+            fc.process(&mut col);
+            for r in 0..h { buf[r * w + c] = col[r]; }
+        }
+    }
+
+    /// WP2 — imperceptibility triptych: original | watermarked | ×RESIDUAL_AMP residual,
+    /// at full source resolution, for the canonical (detail-rich quyen) and the
+    /// flat-background stress fixture (riley). PSNR + max|Δ| printed for the captions.
+    /// NOTE: residual amplification is a single shared constant (`RESIDUAL_AMP`); if the
+    /// white/gray residuals read too subtle we bump it *consistently* across all figures.
+    #[test]
+    #[ignore]
+    fn wp_triptych() {
+        use image::ColorType;
+        let out = wp_figures_dir();
+        for file in ["quyen.jpg", "riley.jpg"] {
+            let stem = file.strip_suffix(".jpg").unwrap_or(file);
+            let path = fixtures_dir().join(file);
+            if !path.exists() { println!("WP2: missing fixture {file}, skipping"); continue; }
+            let img = image::open(&path).unwrap().into_rgb8();
+            let (w, h) = (img.width() as usize, img.height() as usize);
+            let pixels = img.into_raw();
+
+            let orig_y = extract_y_rgb(&pixels);
+            let mut wm_y = orig_y.clone();
+            embed_y(&mut wm_y, w, h, &PHASE3_PAYLOAD);
+            let mut wm_rgb = pixels.clone();
+            write_y_delta_rgb(&mut wm_rgb, &orig_y, &wm_y);
+            let residual = emit_residual(&orig_y, &wm_y, RESIDUAL_AMP);
+
+            image::save_buffer(out.join(format!("triptych_{stem}_original.png")),
+                &pixels, w as u32, h as u32, ColorType::Rgb8).unwrap();
+            image::save_buffer(out.join(format!("triptych_{stem}_watermarked.png")),
+                &wm_rgb, w as u32, h as u32, ColorType::Rgb8).unwrap();
+            image::save_buffer(out.join(format!("triptych_{stem}_residual.png")),
+                &residual, w as u32, h as u32, ColorType::Rgb8).unwrap();
+
+            let p = psnr(&orig_y, &wm_y);
+            let max_d = orig_y.iter().zip(wm_y.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            println!("WP2 triptych [{file}] {w}×{h} → triptych_{stem}_*.png  PSNR={p:.1} dB  max|Δ|={max_d:.2} LSB  residual ×{RESIDUAL_AMP}  (alpha={ALPHA}, levels={EMBED_LEVELS:?})");
+        }
+        println!("WP2 → {}", out.display());
+    }
+
+    /// WP3 — the keyed pattern "we listen for", three synthetic tiles upscaled to
+    /// WP_FIG_LONG: (a) one bit's raw ±1 PN tile; (b) the 192-bit weighted-sum tile
+    /// actually added to each subband (Σ_b sign_b·pn_b); (c) bit 0's spatial-domain
+    /// template (PN tiled into the LH/HL embed bands, inverse-DWT'd) — the actual texture
+    /// the matched filter correlates against.
+    #[test]
+    #[ignore]
+    fn wp_keyed_pattern() {
+        use image::ColorType;
+        let out = wp_figures_dir();
+
+        // (a) raw PN tile for bit 0 (±1 → black/white), TILE_SIDE² upscaled.
+        let pn = pn_tile(0);
+        let (pn_up, aw, ah) = wp_upscale(&pn, TILE_SIDE, TILE_SIDE);
+        let (pn_px, _) = wp_gray_signed(&pn_up);
+        image::save_buffer(out.join("keyed_pn_bit0.png"), &pn_px, aw as u32, ah as u32, ColorType::Rgb8).unwrap();
+
+        // (b) weighted sum of all 192 PN tiles for the test payload: Σ_b sign_b·pn_b[t].
+        let bits = payload_to_bits(&full_payload(&PHASE3_PAYLOAD));
+        let mut weighted = vec![0.0f32; TILE_SIDE * TILE_SIDE];
+        for b in 0..PAYLOAD_BITS {
+            let sign = if bits[b] { 1.0f32 } else { -1.0 };
+            let t = pn_tile(b);
+            for i in 0..weighted.len() { weighted[i] += sign * t[i]; }
+        }
+        let (wsum_up, bw, bh) = wp_upscale(&weighted, TILE_SIDE, TILE_SIDE);
+        let (wsum_px, wpeak) = wp_gray_signed(&wsum_up);
+        image::save_buffer(out.join("keyed_weighted_sum.png"), &wsum_px, bw as u32, bh as u32, ColorType::Rgb8).unwrap();
+
+        // (c) bit 0's spatial-domain template — PN tiled into LH/HL @ EMBED_LEVELS then
+        // inverse-DWT'd (mirrors registration::bit_templates for a single bit; done inline
+        // so this figure needs no `registration` feature and no 192-template build).
+        let fold = TILE_SIDE * 8; // 512 — matches registration::FOLD, kept local so this
+        let frame = 2 * fold;     // figure compiles without the `registration` feature
+        let mut c = vec![0.0f32; frame * frame];
+        for &level in EMBED_LEVELS {
+            for &band in &[Subband::LH, Subband::HL] {
+                let (r0, r1, c0, c1) = subband_bounds(frame, frame, level, band);
+                for r in r0..r1 { for cc in c0..c1 {
+                    let ti = ((r - r0) % TILE_SIDE) * TILE_SIDE + (cc - c0) % TILE_SIDE;
+                    c[r * frame + cc] = pn[ti];
+                }}
+            }
+        }
+        dwt_2d_inv(&mut c, frame, frame, DECOMP_DEPTH);
+        // Interior fold×fold tile (offset fold/2) — avoids inverse-DWT edge effects.
+        let off = fold / 2;
+        let mut tmpl = vec![0.0f32; fold * fold];
+        for ry in 0..fold { for rx in 0..fold {
+            tmpl[ry * fold + rx] = c[(off + ry) * frame + (off + rx)];
+        }}
+        let (tmpl_up, cw, ch) = wp_upscale(&tmpl, fold, fold);
+        let (tmpl_px, tpeak) = wp_gray_signed(&tmpl_up);
+        image::save_buffer(out.join("keyed_template_bit0.png"), &tmpl_px, cw as u32, ch as u32, ColorType::Rgb8).unwrap();
+
+        println!("WP3 keyed pattern → keyed_pn_bit0.png ({aw}×{ah}), keyed_weighted_sum.png ({bw}×{bh}, peak ±{wpeak:.0}), keyed_template_bit0.png ({cw}×{ch}, peak ±{tpeak:.4})");
+        println!("WP3 → {}", out.display());
+    }
+
+    /// WP7 — correlation gain: per-bit matched-filter correlation for a MARKED image vs an
+    /// UNMARKED one (same key, same fixture). Marked bits sit at ≈±ALPHA with the correct
+    /// sign; unmarked bits sit at the image's noise floor near 0. Emits `corr_gain.csv`
+    /// (the paper plots it — "the per-pixel nudge is invisible; the summed correlation
+    /// towers over the floor") plus a stdout summary with the gain ratio.
+    #[test]
+    #[ignore]
+    fn wp_corr_gain() {
+        let out = wp_figures_dir();
+        let img = image::open(canonical_fixture()).unwrap().into_rgb8();
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let pixels = img.into_raw();
+        let orig_y = extract_y_rgb(&pixels);
+        let mut wm_y = orig_y.clone();
+        embed_y(&mut wm_y, w, h, &PHASE3_PAYLOAD);
+
+        let marked = correlate_embed_levels(&wm_y, w, h);
+        let unmarked = correlate_embed_levels(&orig_y, w, h);
+        let bits = payload_to_bits(&full_payload(&PHASE3_PAYLOAD));
+
+        let mut csv = String::from("bit,expected_sign,marked_corr,unmarked_corr\n");
+        for i in 0..PAYLOAD_BITS {
+            csv.push_str(&format!("{},{},{:.5},{:.5}\n",
+                i, if bits[i] { 1 } else { -1 }, marked[i], unmarked[i]));
+        }
+        std::fs::write(out.join("corr_gain.csv"), &csv).unwrap();
+
+        let mean_abs = |v: &[f32]| v.iter().map(|x| x.abs()).sum::<f32>() / v.len() as f32;
+        let (mm, mu) = (mean_abs(&marked), mean_abs(&unmarked));
+        let agree = (0..PAYLOAD_BITS).filter(|&i| (marked[i] > 0.0) == bits[i]).count();
+        println!("WP7 correlation gain → corr_gain.csv  mean|corr| marked={mm:.4} vs unmarked={mu:.4}  (gain ×{:.1})  sign-correct {agree}/{PAYLOAD_BITS}  (alpha={ALPHA})",
+            mm / mu.max(1e-9));
+        println!("WP7 → {}", out.display());
+    }
+
+    /// WP9 — filter zoo for the *Convolution: 2D* explainer. One fixture through a few
+    /// small 3×3 kernels (box blur, Gaussian blur, sharpen, edge-detect); each output is a
+    /// labeled PNG and its weight grid is printed to stdout for the figure's insets.
+    /// Generic per-channel convolution — independent of the watermark.
+    #[test]
+    #[ignore]
+    fn wp_filter_zoo() {
+        use image::ColorType;
+        let out = wp_figures_dir();
+        // Riley (white-seamless, fine eye detail) — one fixture for the full frames, the
+        // locator, and the 1:1 detail crops, so they all share a visual through-line.
+        let img = image::open(fixtures_dir().join("riley.jpg")).unwrap().into_rgb8();
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let src = img.into_raw();
+        // Detail-crop rect: Riley's eye. True 1:1 (the document magnifies 2× on display).
+        let (cx, cy, cw, ch) = (1240usize, 215usize, 300usize, 300usize);
+
+        // 3×3 convolution, per RGB channel, edge-clamped, result clamped to [0,255].
+        fn conv3x3(src: &[u8], w: usize, h: usize, k: &[f32; 9]) -> Vec<u8> {
+            let mut out = vec![0u8; src.len()];
+            for y in 0..h { for x in 0..w {
+                for ch in 0..3 {
+                    let mut acc = 0.0f32;
+                    for ky in 0..3usize { for kx in 0..3usize {
+                        let sy = (y as isize + ky as isize - 1).clamp(0, h as isize - 1) as usize;
+                        let sx = (x as isize + kx as isize - 1).clamp(0, w as isize - 1) as usize;
+                        acc += k[ky * 3 + kx] * src[(sy * w + sx) * 3 + ch] as f32;
+                    }}
+                    out[(y * w + x) * 3 + ch] = acc.clamp(0.0, 255.0) as u8;
+                }
+            }}
+            out
+        }
+
+        // Blurs sum to 1 (brightness-preserving); edge-detect sums to 0 (flat→black, edges bright).
+        let g = 1.0f32 / 16.0;
+        let zoo: &[(&str, [f32; 9])] = &[
+            ("box_blur",    [1.0f32 / 9.0; 9]),
+            ("gaussian",    [g, 2.0 * g, g,  2.0 * g, 4.0 * g, 2.0 * g,  g, 2.0 * g, g]),
+            ("sharpen",     [0., -1., 0.,  -1., 5., -1.,  0., -1., 0.]),
+            ("edge_detect", [-1., -1., -1.,  -1., 8., -1.,  -1., -1., -1.]),
+        ];
+
+        image::save_buffer(out.join("filter_input.png"), &src, w as u32, h as u32, ColorType::Rgb8).unwrap();
+        image::save_buffer(out.join("filter_input_crop.png"), &crop_rgb(&src, w, cx, cy, cw, ch), cw as u32, ch as u32, ColorType::Rgb8).unwrap();
+        // Locator: the full frame with the crop rect drawn on it.
+        let mut loc = src.clone();
+        let lt = (w.max(h) / 400).max(3);
+        wp_draw_rect(&mut loc, w, cy, cy + ch, cx, cx + cw, [230, 30, 30], lt);
+        image::save_buffer(out.join("filter_locator.png"), &loc, w as u32, h as u32, ColorType::Rgb8).unwrap();
+        for (name, k) in zoo {
+            let filtered = conv3x3(&src, w, h, k);
+            image::save_buffer(out.join(format!("filter_{name}.png")), &filtered, w as u32, h as u32, ColorType::Rgb8).unwrap();
+            image::save_buffer(out.join(format!("filter_{name}_crop.png")), &crop_rgb(&filtered, w, cx, cy, cw, ch), cw as u32, ch as u32, ColorType::Rgb8).unwrap();
+            println!("WP9 {name} kernel:");
+            for r in 0..3 { println!("    [{:>6.3} {:>6.3} {:>6.3}]", k[r * 3], k[r * 3 + 1], k[r * 3 + 2]); }
+        }
+        println!("WP9 filter zoo (riley {w}×{h}) → filter_input.png, filter_locator.png, filter_{{box_blur,gaussian,sharpen,edge_detect}}.png  + 1:1 eye crops filter_*_crop.png ({cw}×{ch} @ {cx},{cy})");
+        println!("WP9 → {}", out.display());
+    }
+
+    /// WP1 — Goldilocks (the headline figure): the same fixture+payload embedded at three
+    /// strengths — too weak / production 0.15 / too strong — each as a watermarked image +
+    /// ×RESIDUAL_AMP residual, with a decode verdict through a representative casual channel
+    /// (display 0.6× → 8% center crop → q85 JPEG → production blind decode). Bonus:
+    /// `goldilocks_tuning.csv` — margin (clean native mean|corr|) + PSNR vs α over 8 values,
+    /// the §3.6 tuning curve. (Blind decode ⇒ `registration`-gated; run with that feature.)
+    #[cfg(feature = "registration")]
+    #[test]
+    #[ignore]
+    fn wp_goldilocks() {
+        use image::{codecs::jpeg::JpegEncoder, imageops::{self, FilterType}, ColorType, ExtendedColorType, ImageEncoder, RgbImage};
+        let out = wp_figures_dir();
+        let img = image::open(canonical_fixture()).unwrap().into_rgb8();
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let pixels = img.into_raw();
+        let orig_y = extract_y_rgb(&pixels);
+
+        for &(label, alpha) in &[("weak", 0.03f32), ("goldilocks", 0.15), ("strong", 0.60)] {
+            let mut wm_y = orig_y.clone();
+            embed_y_alpha(&mut wm_y, w, h, &PHASE3_PAYLOAD, alpha, MASK_STRENGTH);
+            let mut wm_rgb = pixels.clone();
+            write_y_delta_rgb(&mut wm_rgb, &orig_y, &wm_y);
+            let residual = emit_residual(&orig_y, &wm_y, RESIDUAL_AMP);
+            image::save_buffer(out.join(format!("goldilocks_{label}_watermarked.png")), &wm_rgb, w as u32, h as u32, ColorType::Rgb8).unwrap();
+            image::save_buffer(out.join(format!("goldilocks_{label}_residual.png")), &residual, w as u32, h as u32, ColorType::Rgb8).unwrap();
+
+            // Representative casual channel: display 0.6× → 8% center crop → q85 JPEG → blind decode.
+            let src = RgbImage::from_raw(w as u32, h as u32, wm_rgb).unwrap();
+            let (nw, nh) = ((w as f32 * 0.6).round() as u32, (h as f32 * 0.6).round() as u32);
+            let scaled = imageops::resize(&src, nw, nh, FilterType::Lanczos3);
+            let (cl, ct) = ((nw as f32 * 0.08) as u32, (nh as f32 * 0.08) as u32);
+            let (cw, ch) = (nw - 2 * cl, nh - 2 * ct);
+            let cropped = imageops::crop_imm(&scaled, cl, ct, cw, ch).to_image();
+            let mut buf = Vec::new();
+            JpegEncoder::new_with_quality(&mut buf, 85).write_image(cropped.as_raw(), cw, ch, ExtendedColorType::Rgb8).unwrap();
+            let dec_rgb = image::load_from_memory(&buf).unwrap().into_rgb8().into_raw();
+            let r = registration::decode_blind_auto(&extract_y_rgb(&dec_rgb), cw as usize, ch as usize);
+
+            let p = psnr(&orig_y, &wm_y);
+            let max_d = orig_y.iter().zip(wm_y.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            println!("WP1 {label:<10} α={alpha:.2}  PSNR={p:.1} dB  max|Δ|={max_d:.1} LSB  → channel(0.6×+8%crop+q85): crc={} errs={} prom={:.1}",
+                r.verified, crop_errs(&r.data), r.confidence);
+        }
+
+        // Bonus tuning curve: clean native margin (mean|corr|) + PSNR vs α.
+        let bits = payload_to_bits(&full_payload(&PHASE3_PAYLOAD));
+        let mut csv = String::from("alpha,psnr_db,max_delta_lsb,mean_abs_corr,signs_correct\n");
+        for &alpha in &[0.02f32, 0.05, 0.08, 0.11, 0.15, 0.22, 0.35, 0.60] {
+            let mut wm_y = orig_y.clone();
+            embed_y_alpha(&mut wm_y, w, h, &PHASE3_PAYLOAD, alpha, MASK_STRENGTH);
+            let corr = correlate_embed_levels(&wm_y, w, h);
+            let margin = corr.iter().map(|x| x.abs()).sum::<f32>() / corr.len() as f32;
+            let signs = (0..PAYLOAD_BITS).filter(|&i| (corr[i] > 0.0) == bits[i]).count();
+            let p = psnr(&orig_y, &wm_y);
+            let max_d = orig_y.iter().zip(wm_y.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            csv.push_str(&format!("{alpha:.2},{p:.2},{max_d:.2},{margin:.4},{signs}\n"));
+            println!("WP1 tune α={alpha:.2}: PSNR={p:.1} dB  margin={margin:.3}  signs {signs}/{PAYLOAD_BITS}");
+        }
+        std::fs::write(out.join("goldilocks_tuning.csv"), &csv).unwrap();
+        println!("WP1 → {}", out.display());
+    }
+
+    /// WP4 — DWT decomposition: forward-transform the canonical fixture and render the
+    /// Mallat subband layout — the deepest approximation linearly scaled, every detail band
+    /// signed-normalized by its own peak (so faint detail is visible) — with the four embed
+    /// bands (LH/HL @ EMBED_LEVELS) outlined. Source resolution; no text (HTML overlays it).
+    #[test]
+    #[ignore]
+    fn wp_dwt_decomp() {
+        use image::ColorType;
+        let out = wp_figures_dir();
+        let img = image::open(canonical_fixture()).unwrap().into_rgb8();
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let mut c = extract_y_rgb(&img.into_raw());
+        dwt_2d_fwd(&mut c, w, h, DECOMP_DEPTH);
+
+        let mut gray = vec![0u8; w * h];
+        // Deepest approximation (LL): linear min..max → 0..255.
+        let (r0, r1, c0, c1) = subband_bounds(w, h, DECOMP_DEPTH, Subband::LL);
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for r in r0..r1 { for cc in c0..c1 { let v = c[r * w + cc]; lo = lo.min(v); hi = hi.max(v); } }
+        let span = (hi - lo).max(1e-6);
+        for r in r0..r1 { for cc in c0..c1 { gray[r * w + cc] = (((c[r * w + cc] - lo) / span) * 255.0).clamp(0.0, 255.0) as u8; } }
+        // Detail bands at every level, centered 128 and scaled to ~3σ (not the max) so
+        // ordinary detail texture spans the range and only rare outlier coefficients clip —
+        // a max-based scale lets a few big coefficients wash the whole band flat gray.
+        for level in 1..=DECOMP_DEPTH {
+            for band in [Subband::HL, Subband::LH, Subband::HH] {
+                let (r0, r1, c0, c1) = subband_bounds(w, h, level, band);
+                if r1 <= r0 || c1 <= c0 { continue; }
+                let (mut sum2, mut n) = (0.0f64, 0u64);
+                for r in r0..r1 { for cc in c0..c1 { let v = c[r * w + cc] as f64; sum2 += v * v; n += 1; } }
+                let std = ((sum2 / n.max(1) as f64).sqrt() as f32).max(1e-6);
+                let s = 127.0 / (3.0 * std);
+                for r in r0..r1 { for cc in c0..c1 { gray[r * w + cc] = (c[r * w + cc] * s + 128.0).clamp(0.0, 255.0) as u8; } }
+            }
+        }
+        // To RGB; outline the four embed bands (LH/HL @ EMBED_LEVELS) in red.
+        let mut rgb: Vec<u8> = gray.iter().flat_map(|&g| [g, g, g]).collect();
+        let thick = (w.max(h) / 512).max(2);
+        for &level in EMBED_LEVELS {
+            for band in [Subband::HL, Subband::LH] {
+                let (r0, r1, c0, c1) = subband_bounds(w, h, level, band);
+                wp_draw_rect(&mut rgb, w, r0, r1, c0, c1, [230, 30, 30], thick);
+            }
+        }
+        image::save_buffer(out.join("dwt_decomposition.png"), &rgb, w as u32, h as u32, ColorType::Rgb8).unwrap();
+        println!("WP4 DWT decomposition ({DECOMP_DEPTH} levels) → dwt_decomposition.png ({w}×{h}); embed bands LH/HL @ levels {EMBED_LEVELS:?} outlined red");
+        println!("WP4 → {}", out.display());
+    }
+
+    /// WP5 — perceptual masking map: the embed gain at the dominant embed level (hot = busy
+    /// = pressed harder), nearest-upsampled and heat-blended over the grayscale fixture.
+    #[test]
+    #[ignore]
+    fn wp_masking_map() {
+        use image::ColorType;
+        let out = wp_figures_dir();
+        let img = image::open(canonical_fixture()).unwrap().into_rgb8();
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let y = extract_y_rgb(&img.into_raw());
+        // masking_gain reads detail energy from the DWT coefficients at the chosen level.
+        let mut coeffs = y.clone();
+        dwt_2d_fwd(&mut coeffs, w, h, DECOMP_DEPTH);
+        let level = EMBED_LEVELS[0];
+        let (gain, gsh, gsw) = masking_gain(&coeffs, w, h, level, MASK_STRENGTH);
+
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for &g in &gain { lo = lo.min(g); hi = hi.max(g); }
+        let span = (hi - lo).max(1e-6);
+        let mut rgb = vec![0u8; w * h * 3];
+        for r in 0..h {
+            for cc in 0..w {
+                let gi = (r * gsh / h).min(gsh - 1);
+                let gj = (cc * gsw / w).min(gsw - 1);
+                let t = ((gain[gi * gsw + gj] - lo) / span).clamp(0.0, 1.0);
+                let heat = wp_heat(t);
+                let base = y[r * w + cc].clamp(0.0, 255.0);
+                let i = (r * w + cc) * 3;
+                for k in 0..3 { rgb[i + k] = (heat[k] as f32 * 0.55 + base * 0.45).clamp(0.0, 255.0) as u8; }
+            }
+        }
+        image::save_buffer(out.join("masking_map.png"), &rgb, w as u32, h as u32, ColorType::Rgb8).unwrap();
+        println!("WP5 masking map (level {level}, gain {lo:.2}..{hi:.2}, mask {MASK_STRENGTH}) → masking_map.png ({w}×{h})  hot=high gain=textured (pressed harder), cool=flat (eased off)");
+        println!("WP5 → {}", out.display());
+    }
+
+    /// WP6 — wavelet texture: the same fixture+payload embedded through Haar vs the
+    /// production CDF 5/3, each as a ×RESIDUAL_AMP residual. Haar's box synthesis basis →
+    /// blocky "popcorn"; 5/3's piecewise-linear basis → soft "watercolor". (9/7 shelved —
+    /// add a third arm here if it's ever evaluated.)
+    #[test]
+    #[ignore]
+    fn wp_wavelet_residuals() {
+        use image::ColorType;
+        let out = wp_figures_dir();
+        // Riley — the white-seamless background showcases the grain, and the eye crop matches
+        // the filter-zoo inset (same Riley eye → a through-line across the document).
+        let img = image::open(fixtures_dir().join("riley.jpg")).unwrap().into_rgb8();
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let orig_y = extract_y_rgb(&img.into_raw());
+        let bits = payload_to_bits(&full_payload(&PHASE3_PAYLOAD));
+        let (cx, cy, cw, ch) = (1240usize, 215usize, 300usize, 300usize); // Riley's eye, 1:1
+
+        // CDF 5/3 (production path).
+        let mut cdf = orig_y.clone();
+        embed_y_alpha(&mut cdf, w, h, &PHASE3_PAYLOAD, ALPHA, MASK_STRENGTH);
+        let res_cdf = emit_residual(&orig_y, &cdf, RESIDUAL_AMP);
+        image::save_buffer(out.join("wavelet_cdf53_residual.png"), &res_cdf, w as u32, h as u32, ColorType::Rgb8).unwrap();
+        image::save_buffer(out.join("wavelet_cdf53_residual_crop.png"), &crop_rgb(&res_cdf, w, cx, cy, cw, ch), cw as u32, ch as u32, ColorType::Rgb8).unwrap();
+        // The CDF residual on riley is exactly the triptych riley residual (same embed) — save
+        // the crop under that name too, for the HTML's convenience.
+        image::save_buffer(out.join("triptych_riley_residual_crop.png"), &crop_rgb(&res_cdf, w, cx, cy, cw, ch), cw as u32, ch as u32, ColorType::Rgb8).unwrap();
+
+        // Haar (test-only transform; same subband layout, same embed, same alpha).
+        let mut haar = orig_y.clone();
+        haar_2d_fwd(&mut haar, w, h, DECOMP_DEPTH);
+        for &level in EMBED_LEVELS {
+            let (gain, gsh, gsw) = masking_gain(&haar, w, h, level, MASK_STRENGTH);
+            for &band in &[Subband::LH, Subband::HL] {
+                let (r0, r1, c0, c1) = subband_bounds(w, h, level, band);
+                if r1 > r0 && c1 > c0 {
+                    embed_in_subband(&mut haar, w, r0, r1, c0, c1, &bits, &gain, gsh, gsw, ALPHA);
+                }
+            }
+        }
+        haar_2d_inv(&mut haar, w, h, DECOMP_DEPTH);
+        let res_haar = emit_residual(&orig_y, &haar, RESIDUAL_AMP);
+        image::save_buffer(out.join("wavelet_haar_residual.png"), &res_haar, w as u32, h as u32, ColorType::Rgb8).unwrap();
+        image::save_buffer(out.join("wavelet_haar_residual_crop.png"), &crop_rgb(&res_haar, w, cx, cy, cw, ch), cw as u32, ch as u32, ColorType::Rgb8).unwrap();
+
+        let pc = psnr(&orig_y, &cdf);
+        let ph = psnr(&orig_y, &haar);
+        println!("WP6 wavelet residuals (riley {w}×{h}) → wavelet_{{cdf53,haar}}_residual.png + 1:1 eye crops *_crop.png  PSNR cdf53={pc:.1} dB, haar={ph:.1} dB  (alpha={ALPHA}, residual ×{RESIDUAL_AMP})");
+        println!("WP6 → {}", out.display());
+    }
+
+    /// WP10 — sparsity strip (DWT explainer): the canonical fixture rebuilt from only its
+    /// largest ~2% of values in (a) the pixel basis (brightest 2% → confetti on black) and
+    /// (b) the wavelet basis (largest-2% coeffs, inverted → nearly fine); (c) the FFT basis
+    /// when built with `registration`. Natural images are sparse in wavelets, not pixels.
+    #[test]
+    #[ignore]
+    fn wp_sparsity_strip() {
+        use image::ColorType;
+        let out = wp_figures_dir();
+        let img = image::open(canonical_fixture()).unwrap().into_rgb8();
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let orig = extract_y_rgb(&img.into_raw());
+        let frac = 0.02f32;
+        let n = orig.len();
+        image::save_buffer(out.join("sparsity_original.png"), &wp_gray_lin(&orig), w as u32, h as u32, ColorType::Rgb8).unwrap();
+
+        // (a) pixel basis — keep the brightest 2% of pixels.
+        let mut px = orig.clone();
+        let kp = wp_keep_top_fraction(&mut px, frac);
+        image::save_buffer(out.join("sparsity_pixel.png"), &wp_gray_lin(&px), w as u32, h as u32, ColorType::Rgb8).unwrap();
+        println!("WP10 (a) pixel   : kept {:.2}% → PSNR {:.1} dB", 100.0 * kp as f32 / n as f32, psnr(&orig, &px));
+
+        // (b) wavelet basis — keep the largest-2% coefficients, invert.
+        let mut cf = orig.clone();
+        dwt_2d_fwd(&mut cf, w, h, DECOMP_DEPTH);
+        let kw = wp_keep_top_fraction(&mut cf, frac);
+        dwt_2d_inv(&mut cf, w, h, DECOMP_DEPTH);
+        image::save_buffer(out.join("sparsity_wavelet.png"), &wp_gray_lin(&cf), w as u32, h as u32, ColorType::Rgb8).unwrap();
+        println!("WP10 (b) wavelet : kept {:.2}% → PSNR {:.1} dB", 100.0 * kw as f32 / n as f32, psnr(&orig, &cf));
+
+        // (c) FFT basis (optional; needs rustfft via the registration feature).
+        #[cfg(feature = "registration")]
+        {
+            use rustfft::{num_complex::Complex, FftPlanner};
+            let mut planner = FftPlanner::<f32>::new();
+            let mut buf: Vec<Complex<f32>> = orig.iter().map(|&v| Complex::new(v, 0.0)).collect();
+            wp_fft2d(&mut buf, w, h, &mut planner, false);
+            let mags: Vec<f32> = buf.iter().map(|z| z.norm()).collect();
+            let keep = (((n as f32) * frac).round() as usize).clamp(1, n);
+            let mut sorted = mags.clone();
+            sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
+            let thr = sorted[keep - 1];
+            let mut kf = 0usize;
+            for (z, m) in buf.iter_mut().zip(mags.iter()) { if *m >= thr { kf += 1; } else { *z = Complex::new(0.0, 0.0); } }
+            wp_fft2d(&mut buf, w, h, &mut planner, true);
+            let sc = 1.0 / n as f32;
+            let recon: Vec<f32> = buf.iter().map(|z| z.re * sc).collect();
+            image::save_buffer(out.join("sparsity_fft.png"), &wp_gray_lin(&recon), w as u32, h as u32, ColorType::Rgb8).unwrap();
+            println!("WP10 (c) fft     : kept {:.2}% → PSNR {:.1} dB", 100.0 * kf as f32 / n as f32, psnr(&orig, &recon));
+        }
+        println!("WP10 → {}", out.display());
+    }
+
+    /// WP11 — band-knockout strip: the fixture rebuilt with one detail level zeroed at a
+    /// time (no L1 / no L2 / no L3), each labeled with its PSNR cost — "the layers,
+    /// demonstrated." Same DWT apparatus as WP10.
+    #[test]
+    #[ignore]
+    fn wp_band_knockout() {
+        use image::ColorType;
+        let out = wp_figures_dir();
+        let img = image::open(canonical_fixture()).unwrap().into_rgb8();
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let orig = extract_y_rgb(&img.into_raw());
+        for level in 1..=3u32 {
+            let mut cf = orig.clone();
+            dwt_2d_fwd(&mut cf, w, h, DECOMP_DEPTH);
+            for band in [Subband::HL, Subband::LH, Subband::HH] {
+                let (r0, r1, c0, c1) = subband_bounds(w, h, level, band);
+                for r in r0..r1 { for cc in c0..c1 { cf[r * w + cc] = 0.0; } }
+            }
+            dwt_2d_inv(&mut cf, w, h, DECOMP_DEPTH);
+            image::save_buffer(out.join(format!("knockout_no_L{level}.png")), &wp_gray_lin(&cf), w as u32, h as u32, ColorType::Rgb8).unwrap();
+            println!("WP11 no-L{level} detail → knockout_no_L{level}.png  PSNR {:.1} dB", psnr(&orig, &cf));
+        }
+        println!("WP11 → {}", out.display());
+    }
+
+    /// WP12 — autocorrelation figures: (a) a synthetic picket fence + its 1D lag profile
+    /// (placeholder for the human's real periodic photo); (b) whitened-autocorr lag profiles
+    /// of a watermarked fixture at 1.0× and 0.5× (the tile-period peak moving 256→128);
+    /// (c) the 2D whitened-autocorr surface (the tile lattice). Profiles → CSV; images → PNG.
+    #[cfg(feature = "registration")]
+    #[test]
+    #[ignore]
+    fn wp_autocorr() {
+        use image::ColorType;
+        let out = wp_figures_dir();
+
+        // (a) synthetic picket fence — vertical bars, period 48 px.
+        let (fw, fh, period) = (768usize, 256usize, 48usize);
+        let mut fence = vec![0.0f32; fw * fh];
+        for r in 0..fh { for c in 0..fw { fence[r * fw + c] = if (c % period) < period / 2 { 220.0 } else { 35.0 }; } }
+        image::save_buffer(out.join("autocorr_fence_synthetic.png"), &wp_gray_lin(&fence), fw as u32, fh as u32, ColorType::Rgb8).unwrap();
+        let row: Vec<f32> = (0..fw).map(|c| fence[c]).collect();
+        let ac = wp_autocorr_1d(&row, fw / 2);
+        let mut csv = String::from("lag,autocorr\n");
+        for (lag, v) in ac.iter().enumerate() { csv.push_str(&format!("{lag},{v:.5}\n")); }
+        std::fs::write(out.join("autocorr_fence_profile.csv"), &csv).unwrap();
+        println!("WP12 (a) synthetic fence (period {period}) → autocorr_fence_synthetic.png + autocorr_fence_profile.csv");
+
+        // (b) watermarked fixture whitened-autocorr lag profile at 1.0× and 0.5×.
+        let img = image::open(canonical_fixture()).unwrap().into_rgb8();
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let orig_y = extract_y_rgb(&img.into_raw());
+        let mut wm = orig_y.clone();
+        embed_y(&mut wm, w, h, &PHASE3_PAYLOAD);
+        for (label, s) in [("1.0", 1.0f32), ("0.5", 0.5)] {
+            let (nw, nh) = ((w as f32 * s).round() as usize, (h as f32 * s).round() as usize);
+            let suspect = if (s - 1.0).abs() < 1e-6 { wm.clone() } else { resample_y(&wm, w, h, nw, nh) };
+            let prof = registration::autocorr_lag_profile(&suspect, nw, nh);
+            let mut csv = String::from("lag,whitened_autocorr\n");
+            for (lag, v) in prof.iter().enumerate() { csv.push_str(&format!("{lag},{v:.6}\n")); }
+            std::fs::write(out.join(format!("autocorr_wm_{label}x_profile.csv")), &csv).unwrap();
+            // Report the level-2 tile-period peak (≈256·s) specifically — the mark is
+            // multi-period (level-3 sits at 512·s), so the global max isn't always level-2;
+            // the CSV carries the full profile for the figure.
+            let expected = (256.0 * s) as usize;
+            let (plo, phi) = ((expected * 4 / 5).max(24), (expected * 6 / 5 + 1).min(prof.len()));
+            let (mut bl, mut bv) = (plo, f32::MIN);
+            for lag in plo..phi { if prof[lag] > bv { bv = prof[lag]; bl = lag; } }
+            println!("WP12 (b) wm {label}×: → autocorr_wm_{label}x_profile.csv  (level-2 period peak at lag {bl}, expected ~{expected})");
+        }
+
+        // (c) 2D whitened-autocorr surface at 1.0× — central crop, DC suppressed, σ-scaled.
+        let (surf, side) = registration::autocorr_surface(&wm, w, h);
+        let cs = 768.min(side);
+        let off = (side - cs) / 2;
+        let mut crop = vec![0.0f32; cs * cs];
+        for r in 0..cs { for c in 0..cs { crop[r * cs + c] = surf[(off + r) * side + (off + c)]; } }
+        let cc = cs / 2;
+        for r in cc.saturating_sub(8)..(cc + 8).min(cs) { for c in cc.saturating_sub(8)..(cc + 8).min(cs) { crop[r * cs + c] = 0.0; } }
+        // The tile lattice is a grid of *positive* correlation peaks; render those on a dark
+        // field (negative → black) at ~2σ so the lattice stands above the whitened noise.
+        let std = ((crop.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / crop.len() as f64).sqrt() as f32).max(1e-9);
+        let sc = 255.0 / (2.0 * std);
+        let px: Vec<u8> = crop.iter().flat_map(|&v| { let g = (v.max(0.0) * sc).clamp(0.0, 255.0) as u8; [g, g, g] }).collect();
+        image::save_buffer(out.join("autocorr_surface_1.0x.png"), &px, cs as u32, cs as u32, ColorType::Rgb8).unwrap();
+        println!("WP12 (c) 2D autocorr surface → autocorr_surface_1.0x.png ({cs}×{cs}, DC suppressed, positive peaks on dark)");
+        println!("WP12 → {}", out.display());
+    }
+
+    /// WP13 — needle vs comb (PN explainer): a PN sequence and an equal-contrast periodic
+    /// stripe sequence, each slid against itself. Noise → one needle at zero offset; stripes
+    /// → a comb of equal peaks. Emits both 1D agreement profiles (CSV) + both 2D tiles (PNG).
+    #[test]
+    #[ignore]
+    fn wp_needle_vs_comb() {
+        use image::ColorType;
+        let out = wp_figures_dir();
+        let n = 512usize;
+        let mut st = WM_KEY ^ 0xA5A5_1234_0000_0001;
+        for _ in 0..16 { xorshift64(&mut st); }
+        let pn: Vec<f32> = (0..n).map(|_| if xorshift64(&mut st) & 1 == 0 { 1.0 } else { -1.0 }).collect();
+        let period = 16usize;
+        let stripe: Vec<f32> = (0..n).map(|i| if (i % period) < period / 2 { 1.0 } else { -1.0 }).collect();
+
+        let ac_pn = wp_autocorr_1d(&pn, n / 2);
+        let ac_st = wp_autocorr_1d(&stripe, n / 2);
+        let mut csv = String::from("lag,pn_agreement,stripe_agreement\n");
+        for lag in 0..ac_pn.len() { csv.push_str(&format!("{lag},{:.5},{:.5}\n", ac_pn[lag], ac_st[lag])); }
+        std::fs::write(out.join("needle_vs_comb.csv"), &csv).unwrap();
+
+        // 2D tiles for the visual (TILE_SIDE² upscaled): a keyed PN tile and a stripe tile.
+        let pn2 = pn_tile(0);
+        let st2: Vec<f32> = (0..TILE_SIDE * TILE_SIDE).map(|i| if ((i % TILE_SIDE) % period) < period / 2 { 1.0 } else { -1.0 }).collect();
+        let (pu, pw, ph) = wp_upscale(&pn2, TILE_SIDE, TILE_SIDE);
+        let (pn_px, _) = wp_gray_signed(&pu);
+        image::save_buffer(out.join("needle_pn_tile.png"), &pn_px, pw as u32, ph as u32, ColorType::Rgb8).unwrap();
+        let (su, sw, sh) = wp_upscale(&st2, TILE_SIDE, TILE_SIDE);
+        let (st_px, _) = wp_gray_signed(&su);
+        image::save_buffer(out.join("comb_stripe_tile.png"), &st_px, sw as u32, sh as u32, ColorType::Rgb8).unwrap();
+        println!("WP13 needle-vs-comb → needle_vs_comb.csv, needle_pn_tile.png, comb_stripe_tile.png  (PN lag0={:.2} lag1={:.3}; stripe peaks every {period})", ac_pn[0], ac_pn[1]);
+        println!("WP13 → {}", out.display());
+    }
+
+    /// WP14 — random-dot autostereogram (PN explainer): a single image (SIRDS) hiding a
+    /// raised disc in random dots — "the reader is the correlator." Deterministic seed →
+    /// stable committed image; caption carries free-viewing instructions.
+    #[test]
+    #[ignore]
+    fn wp_stereogram() {
+        use image::ColorType;
+        let out = wp_figures_dir();
+        let (w, h) = (900usize, 600usize);
+        let e = 120usize;          // base dot separation (px)
+        let mu = 1.0f32 / 3.0;     // depth scale
+        let (cx, cy, rad) = (w as f32 / 2.0, h as f32 / 2.0, h as f32 * 0.28);
+        let mut img = vec![0u8; w * h];
+        let mut state = 0x1234_5678_9abc_def0u64;
+        for y in 0..h {
+            let mut same: Vec<usize> = (0..w).collect();
+            for x in 0..w {
+                let inside = ((x as f32 - cx).powi(2) + (y as f32 - cy).powi(2)).sqrt() < rad;
+                let z = if inside { 1.0f32 } else { 0.0 };           // raised disc on flat ground
+                let sep = ((1.0 - mu * z) * e as f32 / (2.0 - mu * z)).round() as isize;
+                let left = x as isize - sep / 2;
+                let right = left + sep;
+                if left >= 0 && (right as usize) < w { same[right as usize] = left as usize; } // link right→left
+            }
+            for x in 0..w { // fill left→right so each link's target is already set
+                img[y * w + x] = if same[x] == x {
+                    if xorshift64(&mut state) & 1 == 0 { 255 } else { 0 }
+                } else { img[y * w + same[x]] };
+            }
+        }
+        let rgb: Vec<u8> = img.iter().flat_map(|&v| [v, v, v]).collect();
+        image::save_buffer(out.join("stereogram.png"), &rgb, w as u32, h as u32, ColorType::Rgb8).unwrap();
+        println!("WP14 autostereogram ({w}×{h}, raised disc, sep {e}) → stereogram.png  (cross-eyed or parallel free-viewing reveals a floating disc)");
+        println!("WP14 → {}", out.display());
+    }
+
     // ── Phase 4: Resize robustness ────────────────────────────────────────────
     //
     // 2× downscale: DWT level k of original → level k-1 of scaled image.
@@ -2154,6 +2970,7 @@ config ALPHA={a}, levels={lv:?}, mask={mk}, ECC=BCH(192,160) t={t}._",
     }
 
     // Human-readable decode duration: sub-second in ms, else seconds.
+    #[cfg(feature = "registration")] // only the registration-gated blind_auto_sweep uses it
     fn fmt_secs(x: f64) -> String {
         if x >= 1.0 { format!("{x:.1} s") } else { format!("{} ms", (x * 1000.0).round() as u64) }
     }

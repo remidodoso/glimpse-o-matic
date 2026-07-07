@@ -1,0 +1,7 @@
+# White-paper figure artifacts.
+#
+# Policy: anything destined for the paper's HTML is committed (the "dumbnail"
+# convention shrinks full-res figures at display time, never the asset). Regenerable
+# intermediates and scratch are ignored — regenerate via build-figures.ps1 (WP8).
+figures/intermediate/
+*.tmp

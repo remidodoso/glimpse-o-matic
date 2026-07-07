@@ -1,0 +1,46 @@
+<svg viewBox="0 0 720 380" xmlns="http://www.w3.org/2000/svg" role="img"
+     aria-label="Hamming(7,4) as three overlapping circles, and a single-bit error located">
+  <style>
+    .circ { fill: none; stroke: #9c9488; stroke-width: 1.5; }
+    .odd  { fill: #b9802f; fill-opacity: 0.16; stroke: #b9802f; stroke-width: 2.2; }
+    .data { font-family: system-ui, sans-serif; fill: #b9802f; font-size: 15px; font-weight: 600; }
+    .par  { font-family: system-ui, sans-serif; fill: #5b8a90; font-size: 15px; font-weight: 600; }
+    .lab  { font-family: system-ui, sans-serif; fill: #6f675a; font-size: 13px; font-weight: 600; }
+    .cap  { font-family: system-ui, sans-serif; fill: #8c8475; font-size: 13px; }
+    .ttl  { font-family: system-ui, sans-serif; fill: #6f675a; font-size: 14px; font-weight: 600; }
+    .flip { fill: none; stroke: #b9802f; stroke-width: 2; }
+  </style>
+
+  <!-- ── Panel 1: the layout ───────────────────────────────────────────── -->
+  <text class="ttl" x="185" y="24" text-anchor="middle">4 data bits + 3 parity bits</text>
+  <!-- circles A(top) B(lower-left) C(lower-right), centre (185,205) -->
+  <circle class="circ" cx="185" cy="150" r="92"/>
+  <circle class="circ" cx="121" cy="248" r="92"/>
+  <circle class="circ" cx="249" cy="248" r="92"/>
+  <!-- data: centre + 3 pairwise lenses -->
+  <text class="data" x="185" y="216" text-anchor="middle">d4</text>
+  <text class="data" x="135" y="188" text-anchor="middle">d1</text>
+  <text class="data" x="235" y="188" text-anchor="middle">d2</text>
+  <text class="data" x="185" y="270" text-anchor="middle">d3</text>
+  <!-- parity: outer-only of each circle -->
+  <text class="par" x="185" y="108" text-anchor="middle">p1</text>
+  <text class="par" x="86"  y="285" text-anchor="middle">p2</text>
+  <text class="par" x="284" y="285" text-anchor="middle">p3</text>
+  <text class="cap" x="185" y="362" text-anchor="middle">each circle's parity bit makes its total even</text>
+
+  <!-- ── Panel 2: a flipped bit, located ───────────────────────────────── -->
+  <text class="ttl" x="535" y="24" text-anchor="middle">One bit flips → two circles go odd</text>
+  <!-- circles A and B odd (shaded), C even -->
+  <circle class="odd"  cx="535" cy="150" r="92"/>
+  <circle class="odd"  cx="471" cy="248" r="92"/>
+  <circle class="circ" cx="599" cy="248" r="92"/>
+  <!-- circle identity labels -->
+  <text class="lab" x="535" y="74"  text-anchor="middle" fill="#b9802f">circle 1 (odd)</text>
+  <text class="lab" x="398" y="300" text-anchor="middle" fill="#b9802f">circle 2 (odd)</text>
+  <text class="lab" x="660" y="300" text-anchor="middle">circle 3 (even)</text>
+  <!-- the flipped bit at the 1∩2 lens (d1) -->
+  <circle class="flip" cx="487" cy="186" r="15"/>
+  <text class="data" x="487" y="191" text-anchor="middle">d1</text>
+  <text class="cap" x="535" y="356" text-anchor="middle">odd in 1 and 2, even in 3 — the one region</text>
+  <text class="cap" x="535" y="372" text-anchor="middle">in both 1 and 2 but not 3. Flip it back.</text>
+</svg>
